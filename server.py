@@ -6,201 +6,199 @@ import select
 import os
 import sys
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from common import TunnelCrypto, generate_config_wizard, UDPPacket
-
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle requests in separate threads."""
-    daemon_threads = True
+from common import TunnelCrypto, generate_config_wizard, PROTO_TCP, PROTO_UDP
 
 class TunnelHandler(BaseHTTPRequestHandler):
     crypto = None
     max_post_bytes = 5242880
-    timeout = 60
+    timeout = 30
+    udp_timeout = 60
     sessions = {}
     sessions_lock = threading.Lock()
+    executor = ThreadPoolExecutor(max_workers=50)
     
     def do_POST(self):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length > self.max_post_bytes:
-                self.send_error(413)
+                self.send_error(413, "Payload too large")
                 return
             
             body = self.rfile.read(content_length).decode()
-            
-            # Quick response to keep connection alive
-            if not body:
-                self._send_encrypted(b"")
-                return
-            
             try:
                 plain = self.crypto.decrypt(body)
-            except Exception:
-                self.send_error(400)
+            except Exception as e:
+                print(f"Decryption failed: {e}")
+                self.send_error(400, "Decryption failed")
                 return
             
-            # Parse message type
+            # Parse the message
             try:
                 msg = json.loads(plain.decode())
-                if isinstance(msg, dict):
-                    msg_type = msg.get("type")
-                    if msg_type == "connect":
-                        self._handle_connect(msg)
-                    elif msg_type == "udp_associate":
-                        self._handle_udp_associate(msg)
-                    else:
-                        self._send_encrypted(json.dumps({"status": "error", "reason": "Unknown type"}).encode())
+                if isinstance(msg, dict) and msg.get("type") == "connect":
+                    self._handle_connect(msg)
                     return
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
             
-            # Handle session messages
+            # Handle session-prefixed messages
             if b'::' in plain:
                 parts = plain.split(b'::', 1)
                 session_id = parts[0].decode('ascii', errors='ignore')
-                message = parts[1]
+                message = parts[1] if len(parts) > 1 else b""
                 
                 if session_id in self.sessions:
-                    self._handle_session_message(session_id, message)
+                    # Check if it's a UDP packet
+                    if message.startswith(b"UDP:"):
+                        self._handle_udp_data(session_id, message[4:])
+                    else:
+                        self._handle_tcp_data(session_id, message)
                 else:
                     self._send_encrypted(b"invalid_session")
             else:
                 self._send_encrypted(b"invalid_format")
                 
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error handling POST: {e}")
             try:
                 self.send_error(500)
             except:
                 pass
     
     def _handle_connect(self, msg):
-        """Handle TCP connect request."""
         host = msg.get("host")
         port = msg.get("port")
+        proto = msg.get("proto", PROTO_TCP)
+        
+        if not host or not port:
+            resp = json.dumps({"status": "error", "reason": "Missing host/port"})
+            self._send_encrypted(resp.encode())
+            return
         
         try:
-            dest_sock = socket.create_connection((host, port), timeout=10)
-            dest_sock.setblocking(False)
-            
             session_id = self._generate_session_id()
+            
+            if proto == PROTO_UDP:
+                # Create UDP socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setblocking(False)
+                print(f"UDP session {session_id} created for {host}:{port}")
+            else:
+                # Create TCP connection
+                print(f"Connecting TCP to {host}:{port}...")
+                sock = socket.create_connection((host, port), timeout=10)
+                sock.setblocking(False)
+                print(f"TCP session {session_id} created for {host}:{port}")
+            
             with self.sessions_lock:
                 self.sessions[session_id] = {
-                    'type': 'tcp',
-                    'socket': dest_sock,
+                    'socket': sock,
                     'last_active': time.time(),
                     'host': host,
-                    'port': port
+                    'port': port,
+                    'proto': proto,
+                    'created': time.time(),
+                    'pending_tcp_data': b"",
+                    'udp_buffer': []
                 }
             
-            print(f"TCP session {session_id}: {host}:{port}")
-            self._send_encrypted(json.dumps({"status": "ok", "session": session_id}).encode())
+            resp = json.dumps({"status": "ok", "session": session_id, "proto": proto})
+            self._send_encrypted(resp.encode())
             
         except Exception as e:
-            print(f"Connect failed: {host}:{port}: {e}")
-            self._send_encrypted(json.dumps({"status": "error", "reason": str(e)}).encode())
+            print(f"Connection failed to {host}:{port}: {e}")
+            resp = json.dumps({"status": "error", "reason": str(e)})
+            self._send_encrypted(resp.encode())
     
-    def _handle_udp_associate(self, msg):
-        """Handle UDP associate request."""
-        session_id = self._generate_session_id()
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setblocking(False)
-        
-        with self.sessions_lock:
-            self.sessions[session_id] = {
-                'type': 'udp',
-                'socket': udp_sock,
-                'last_active': time.time(),
-                'host': '0.0.0.0',
-                'port': 0
-            }
-        
-        print(f"UDP session {session_id} created")
-        self._send_encrypted(json.dumps({"status": "ok", "session": session_id}).encode())
-    
-    def _handle_session_message(self, session_id, message):
-        """Handle data for existing session."""
+    def _handle_tcp_data(self, session_id, message):
+        """Handle TCP data messages - respond immediately."""
         with self.sessions_lock:
             session = self.sessions.get(session_id)
-            if not session:
+            if not session or session['proto'] != PROTO_TCP:
                 self._send_encrypted(b"invalid_session")
                 return
             session['last_active'] = time.time()
         
+        sock = session['socket']
+        
+        # Handle control messages
         if message == b"CLOSE":
+            print(f"TCP session {session_id} closed by client")
             self._close_session(session_id)
             self._send_encrypted(b"closed")
             return
         
-        if message == b"HEARTBEAT":
-            self._send_encrypted(b"")
-            return
+        # Forward data to destination
+        if message and message != b"HEARTBEAT":
+            try:
+                sock.sendall(message)
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                print(f"TCP session {session_id}: Write error: {e}")
+                self._close_session(session_id)
+                self._send_encrypted(b"destination_closed")
+                return
         
-        if session['type'] == 'udp':
-            self._handle_udp_data(session, message)
-        else:
-            self._handle_tcp_data(session, message)
-    
-    def _handle_tcp_data(self, session, data):
-        """Handle TCP data forwarding."""
-        dest_sock = session['socket']
-        
+        # Read available data immediately
+        response_data = b""
         try:
-            dest_sock.sendall(data)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            self._close_session_by_socket(dest_sock)
-            self._send_encrypted(b"destination_closed")
-            return
-        
-        # Read response with timeout
-        response = b""
-        deadline = time.time() + 0.1  # 100ms max wait
-        
-        try:
-            while time.time() < deadline:
-                ready = select.select([dest_sock], [], [], 0.01)
+            while True:
+                ready = select.select([sock], [], [], 0.001)
                 if ready[0]:
-                    chunk = dest_sock.recv(65536)
+                    chunk = sock.recv(65536)
                     if not chunk:
-                        self._close_session_by_socket(dest_sock)
-                        if not response:
-                            response = b"destination_closed"
+                        print(f"TCP session {session_id}: Destination closed")
+                        self._close_session(session_id)
+                        response_data = b"destination_closed"
                         break
-                    response += chunk
-                    if len(response) >= self.max_post_bytes - 2000:
+                    response_data += chunk
+                    if len(response_data) >= self.max_post_bytes - 2000:
                         break
                 else:
                     break
-        except (BlockingIOError, BrokenPipeError, ConnectionResetError, OSError):
+        except (BlockingIOError, socket.error):
             pass
+        except Exception as e:
+            print(f"TCP session {session_id}: Read error: {e}")
+            self._close_session(session_id)
+            response_data = b"destination_closed"
         
-        self._send_encrypted(response)
+        # Always respond immediately
+        self._send_encrypted(response_data if response_data else b"")
     
-    def _handle_udp_data(self, session, data):
-        """Handle UDP data forwarding."""
-        udp_sock = session['socket']
+    def _handle_udp_data(self, session_id, data):
+        """Handle UDP data - respond with any pending data."""
+        with self.sessions_lock:
+            session = self.sessions.get(session_id)
+            if not session or session['proto'] != PROTO_UDP:
+                self._send_encrypted(b"invalid_session")
+                return
+            session['last_active'] = time.time()
         
-        # Data should contain SOCKS5 UDP packet
-        packet_data, addr = UDPPacket.decode(data)
-        if packet_data and addr:
+        sock = session['socket']
+        
+        # Forward UDP packet to destination
+        if data and data != b"CLOSE" and data != b"HEARTBEAT":
             try:
-                udp_sock.sendto(packet_data, addr)
+                addr = (session['host'], session['port'])
+                sock.sendto(data, addr)
             except Exception as e:
-                print(f"UDP send error: {e}")
+                print(f"UDP session {session_id}: Send error: {e}")
         
-        # Read response
-        response = b""
+        # Check for incoming UDP data
+        response_data = b""
         try:
-            ready = select.select([udp_sock], [], [], 0.05)
+            ready = select.select([sock], [], [], 0.001)
             if ready[0]:
-                resp_data, resp_addr = udp_sock.recvfrom(65536)
-                response = UDPPacket.encode(resp_data, resp_addr)
-        except (BlockingIOError, OSError):
+                data, addr = sock.recvfrom(65536)
+                response_data = data
+        except (BlockingIOError, socket.error):
             pass
         
-        self._send_encrypted(response)
+        self._send_encrypted(response_data if response_data else b"")
     
     def _send_encrypted(self, data_bytes):
         try:
@@ -214,6 +212,8 @@ class TunnelHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+        except Exception as e:
+            print(f"Error sending response: {e}")
     
     def _generate_session_id(self):
         import uuid
@@ -228,48 +228,46 @@ class TunnelHandler(BaseHTTPRequestHandler):
                     pass
                 del self.sessions[session_id]
     
-    def _close_session_by_socket(self, sock):
-        with self.sessions_lock:
-            for sid, s in list(self.sessions.items()):
-                if s['socket'] == sock:
-                    try:
-                        sock.close()
-                    except:
-                        pass
-                    del self.sessions[sid]
-                    break
-    
     def log_message(self, format, *args):
-        pass  # Suppress default logging
+        # Suppress default logging for normal operations
+        if args and "200" in str(args[0]):
+            return  # Don't log successful requests
+        print(f"[{self.client_address[0]}] {format % args}")
 
 class SessionCleaner(threading.Thread):
-    def __init__(self, handler_class, cleanup_interval=120, session_timeout=60):
+    def __init__(self, handler_class, cleanup_interval=30):
         super().__init__(daemon=True)
         self.handler_class = handler_class
         self.cleanup_interval = cleanup_interval
-        self.session_timeout = session_timeout
     
     def run(self):
         while True:
             time.sleep(self.cleanup_interval)
             with self.handler_class.sessions_lock:
                 now = time.time()
-                stale = [
-                    sid for sid, s in self.handler_class.sessions.items()
-                    if now - s['last_active'] > self.session_timeout
-                ]
+                stale = []
+                for sid, s in self.handler_class.sessions.items():
+                    if s['proto'] == PROTO_UDP:
+                        timeout = self.handler_class.udp_timeout
+                    else:
+                        timeout = self.handler_class.timeout
+                    
+                    if now - s['last_active'] > timeout:
+                        stale.append(sid)
+                
                 for sid in stale:
+                    s = self.handler_class.sessions[sid]
+                    age = now - s['last_active']
+                    print(f"Cleaning {s['proto']} session {sid} (idle {age:.0f}s)")
                     try:
-                        self.handler_class.sessions[sid]['socket'].close()
+                        s['socket'].close()
                     except:
                         pass
                     del self.handler_class.sessions[sid]
-                if stale:
-                    print(f"Cleaned {len(stale)} stale sessions")
 
 def run_server(config_path="server_config.json"):
     if not os.path.exists(config_path):
-        print(f"Config not found. Running wizard...")
+        print(f"Config file {config_path} not found. Running setup wizard...")
         if not generate_config_wizard(config_path, "server"):
             print("Setup cancelled.")
             return
@@ -280,20 +278,23 @@ def run_server(config_path="server_config.json"):
     TunnelHandler.crypto = TunnelCrypto(config["encryption_key"])
     TunnelHandler.max_post_bytes = config["max_post_bytes"]
     TunnelHandler.timeout = config["timeout"]
+    TunnelHandler.udp_timeout = config.get("udp_timeout", 60)
     
-    cleanup_interval = config.get("cleanup_interval", 120)
-    cleaner = SessionCleaner(TunnelHandler, cleanup_interval, config["timeout"])
+    cleanup_interval = config.get("cleanup_interval", 30)
+    cleaner = SessionCleaner(TunnelHandler, cleanup_interval)
     cleaner.start()
     
     host, port = config["listen"].split(":")
-    workers = config.get("workers", 10)
-    server = ThreadingHTTPServer((host, int(port)), TunnelHandler)
-    print(f"Tunnel server on {host}:{port} (workers: {workers})")
+    server = HTTPServer((host, int(port)), TunnelHandler)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    print(f"Tunnel server listening on {host}:{port}")
+    print(f"Max POST size: {config['max_post_bytes']} bytes")
+    print(f"TCP timeout: {config['timeout']}s, UDP timeout: {config.get('udp_timeout', 60)}s")
     
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\nShutting down server...")
         server.shutdown()
 
 if __name__ == "__main__":
