@@ -81,7 +81,7 @@ pip install cryptography requests
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/http-tunnel.git
+git clone https://github.com/HoomanJCode/http-tunnel.git
 cd http-tunnel
 
 # Install dependencies
