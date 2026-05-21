@@ -2,7 +2,7 @@ import json
 import os
 import base64
 import hashlib
-import struct
+import logging
 from cryptography.fernet import Fernet
 
 class TunnelCrypto:
@@ -18,6 +18,26 @@ class TunnelCrypto:
     def decrypt(self, token: str) -> bytes:
         encrypted = base64.urlsafe_b64decode(token.encode())
         return self.fernet.decrypt(encrypted)
+
+def setup_logging(config, name="tunnel"):
+    """Setup logging based on config."""
+    log_level = config.get("log_level", "INFO").upper()
+    level = getattr(logging, log_level, logging.INFO)
+    
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    return logging.getLogger(name)
+
+def mask_sensitive(data):
+    """Mask sensitive data for logging."""
+    if isinstance(data, str) and len(data) > 20:
+        return data[:8] + "***" + data[-8:]
+    elif isinstance(data, bytes) and len(data) > 20:
+        return str(data[:8]) + "***" + str(data[-8:])
+    return str(data)
 
 # Protocol constants
 PROTO_TCP = 1
@@ -50,6 +70,12 @@ def generate_config_wizard(config_path, config_type="client"):
         psk = secrets.token_hex(16)
         print(f"Generated random PSK: {psk}")
     config["encryption_key"] = psk
+    
+    # Log level configuration
+    print("\n=== Logging ===")
+    print("Log levels: DEBUG, INFO, WARNING, ERROR")
+    log_level = input("Log level [INFO]: ").strip().upper()
+    config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
     
     if config_type == "server":
         print("\n=== Server Configuration ===")
