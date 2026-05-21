@@ -64,6 +64,34 @@ class SocksToHttpTunnel:
             print(f"HTTP error: {e}")
             raise
     
+    def _resolve_hostname(self, host):
+        """Try to resolve hostname to IPv4, fallback to original."""
+        try:
+            # Check if it's already an IP address
+            socket.inet_pton(socket.AF_INET, host)
+            return host, False
+        except socket.error:
+            pass
+        
+        try:
+            socket.inet_pton(socket.AF_INET6, host)
+            return host, True  # It's IPv6
+        except socket.error:
+            pass
+        
+        # It's a hostname, try to resolve to IPv4 first
+        try:
+            addr_info = socket.getaddrinfo(host, None, socket.AF_INET)
+            if addr_info:
+                ipv4 = addr_info[0][4][0]
+                print(f"Resolved {host} to IPv4: {ipv4}")
+                return ipv4, False
+        except socket.gaierror:
+            pass
+        
+        # Fallback to original hostname (server will resolve it)
+        return host, False
+    
     def handle_socks_connection(self, local_conn: socket.socket, client_addr):
         """Handle a SOCKS5 client connection."""
         session_id = None
@@ -107,9 +135,12 @@ class SocksToHttpTunnel:
             elif atyp == 3:  # Domain name
                 length = local_conn.recv(1)[0]
                 target_host = local_conn.recv(length).decode()
+                # Resolve hostname to IPv4 if possible
+                target_host, is_ipv6 = self._resolve_hostname(target_host)
             elif atyp == 4:  # IPv6
                 addr_bytes = local_conn.recv(16)
                 target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+                print(f"[{client_addr}] IPv6 address detected, trying to use as-is")
             else:
                 print(f"[{client_addr}] Unsupported address type: {atyp}")
                 local_conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -119,7 +150,7 @@ class SocksToHttpTunnel:
             port_bytes = local_conn.recv(2)
             target_port = int.from_bytes(port_bytes, 'big')
             
-            print(f"[{client_addr}] Target: {target_host}:{target_port}, cmd={cmd}")
+            print(f"[{client_addr}] Target: {target_host}:{target_port}")
             
             # Handle different SOCKS5 commands
             if cmd == 1:  # CONNECT (TCP)
@@ -335,11 +366,6 @@ class SocksToHttpTunnel:
                         enc_heartbeat = self.crypto.encrypt(heartbeat_msg)
                         resp_text = self._http_post(enc_heartbeat)
                         plain_response = self.crypto.decrypt(resp_text)
-                        
-                        if plain_response and plain_response != b"HEARTBEAT":
-                            # Can't send to specific client in UDP without their address
-                            pass
-                        
                         last_activity = now
                     except:
                         pass

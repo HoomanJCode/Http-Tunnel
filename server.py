@@ -69,6 +69,42 @@ class TunnelHandler(BaseHTTPRequestHandler):
             except:
                 pass
     
+    def _resolve_and_connect(self, host, port):
+        """Resolve hostname and connect, trying IPv4 first."""
+        # Check if it's an IPv6 address
+        try:
+            socket.inet_pton(socket.AF_INET6, host)
+            # It's IPv6, try to connect directly
+            try:
+                sock = socket.create_connection((host, port), timeout=10)
+                return sock
+            except OSError as e:
+                print(f"IPv6 connection failed: {e}")
+                raise
+        except socket.error:
+            pass
+        
+        # Try to resolve as hostname, prefer IPv4
+        try:
+            addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            # Sort: IPv4 first
+            addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+            
+            for family, socktype, proto, canonname, sockaddr in addrs:
+                try:
+                    print(f"Trying {sockaddr}...")
+                    sock = socket.socket(family, socktype, proto)
+                    sock.settimeout(10)
+                    sock.connect(sockaddr)
+                    return sock
+                except OSError as e:
+                    print(f"Failed: {e}")
+                    continue
+            
+            raise OSError("Could not connect to any address")
+        except socket.gaierror as e:
+            raise OSError(f"DNS resolution failed: {e}")
+    
     def _handle_connect(self, msg):
         host = msg.get("host")
         port = msg.get("port")
@@ -88,9 +124,9 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 sock.setblocking(False)
                 print(f"UDP session {session_id} created for {host}:{port}")
             else:
-                # Create TCP connection
+                # Create TCP connection with smart resolution
                 print(f"Connecting TCP to {host}:{port}...")
-                sock = socket.create_connection((host, port), timeout=10)
+                sock = self._resolve_and_connect(host, port)
                 sock.setblocking(False)
                 print(f"TCP session {session_id} created for {host}:{port}")
             
@@ -101,9 +137,7 @@ class TunnelHandler(BaseHTTPRequestHandler):
                     'host': host,
                     'port': port,
                     'proto': proto,
-                    'created': time.time(),
-                    'pending_tcp_data': b"",
-                    'udp_buffer': []
+                    'created': time.time()
                 }
             
             resp = json.dumps({"status": "ok", "session": session_id, "proto": proto})
@@ -229,10 +263,9 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 del self.sessions[session_id]
     
     def log_message(self, format, *args):
-        # Suppress default logging for normal operations
-        if args and "200" in str(args[0]):
-            return  # Don't log successful requests
-        print(f"[{self.client_address[0]}] {format % args}")
+        # Only log errors and important events
+        if "200" not in str(args[0]) if args else True:
+            print(f"[{self.client_address[0]}] {format % args}")
 
 class SessionCleaner(threading.Thread):
     def __init__(self, handler_class, cleanup_interval=30):
