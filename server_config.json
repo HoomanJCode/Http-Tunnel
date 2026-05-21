@@ -1,0 +1,6 @@
+{
+    "listen": "0.0.0.0:8080",
+    "encryption_key": "a-very-long-base64-urlsafe-key-from-fernet",
+    "max_post_bytes": 65536,
+    "timeout": 30
+}
