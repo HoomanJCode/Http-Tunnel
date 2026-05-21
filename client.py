@@ -7,7 +7,7 @@ import os
 import sys
 import logging
 import requests
-from common import TunnelCrypto, generate_config_wizard, setup_logging, mask_sensitive, PROTO_TCP, PROTO_UDP
+from common import TunnelCrypto, generate_config_wizard, setup_logging, PROTO_TCP, PROTO_UDP
 
 class SocksToHttpTunnel:
     def __init__(self, config_path="client_config.json"):
@@ -18,6 +18,14 @@ class SocksToHttpTunnel:
         
         with open(config_path) as f:
             self.config = json.load(f)
+        
+        # Set defaults for missing config options
+        self.config.setdefault("http_timeout", 30)
+        self.config.setdefault("heartbeat_interval", 1)
+        self.config.setdefault("max_post_bytes", 5242880)
+        self.config.setdefault("batch_wait", 0.01)
+        self.config.setdefault("reconnect_delay", 0.5)
+        self.config.setdefault("log_level", "INFO")
         
         # Setup logging
         self.logger = setup_logging(self.config, "client")
@@ -38,8 +46,8 @@ class SocksToHttpTunnel:
         self.max_bytes = self.config["max_post_bytes"]
         self.batch_wait = self.config["batch_wait"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
-        self.http_timeout = self.config.get("http_timeout", 5)
-        self.reconnect_delay = self.config.get("reconnect_delay", 0.5)
+        self.http_timeout = self.config["http_timeout"]
+        self.reconnect_delay = self.config["reconnect_delay"]
         
         socks_addr = self.config["socks_listen"].split(":")
         self.socks_host = socks_addr[0]
@@ -53,7 +61,7 @@ class SocksToHttpTunnel:
         headers = {"Content-Type": "text/plain"}
         proxies = self.proxies if self.proxies else None
         
-        self.logger.debug(f"[{context}] POST request: {len(body)} bytes")
+        self.logger.debug(f"[{context}] POST: {len(body)}B")
         
         try:
             start_time = time.time()
@@ -66,7 +74,7 @@ class SocksToHttpTunnel:
             )
             elapsed = (time.time() - start_time) * 1000
             resp.raise_for_status()
-            self.logger.debug(f"[{context}] Response: {len(resp.text)} bytes in {elapsed:.0f}ms")
+            self.logger.debug(f"[{context}] Response: {len(resp.text)}B in {elapsed:.0f}ms")
             return resp.text
         except requests.exceptions.Timeout:
             self.logger.error(f"[{context}] Timeout after {self.http_timeout}s")
@@ -93,7 +101,7 @@ class SocksToHttpTunnel:
             local_conn.settimeout(10)
             greeting = local_conn.recv(2)
             if len(greeting) < 2:
-                self.logger.error(f"[{thread_id}] Incomplete greeting from {client_str}")
+                self.logger.error(f"[{thread_id}] Incomplete greeting")
                 return
             
             ver, nmethods = greeting
@@ -103,7 +111,7 @@ class SocksToHttpTunnel:
                 return
             
             methods = local_conn.recv(nmethods)
-            self.logger.debug(f"[{thread_id}] Client methods: {list(methods)}")
+            self.logger.debug(f"[{thread_id}] Auth methods: {list(methods)}")
             
             # Accept no authentication
             local_conn.sendall(b"\x05\x00")
@@ -111,13 +119,13 @@ class SocksToHttpTunnel:
             # Step 2: SOCKS5 request
             request = local_conn.recv(4)
             if len(request) < 4:
-                self.logger.error(f"[{thread_id}] Incomplete request from {client_str}")
+                self.logger.error(f"[{thread_id}] Incomplete request")
                 return
             
             ver, cmd, rsv, atyp = request
             cmd_names = {1: "CONNECT", 2: "BIND", 3: "UDP ASSOCIATE"}
             atyp_names = {1: "IPv4", 3: "DOMAIN", 4: "IPv6"}
-            self.logger.info(f"[{thread_id}] Request: {cmd_names.get(cmd, 'UNKNOWN')} ({atyp_names.get(atyp, 'UNKNOWN')})")
+            self.logger.info(f"[{thread_id}] Request: {cmd_names.get(cmd, 'UNKNOWN')}")
             
             # Parse target address
             if atyp == 1:  # IPv4
@@ -129,7 +137,7 @@ class SocksToHttpTunnel:
             elif atyp == 4:  # IPv6
                 addr_bytes = local_conn.recv(16)
                 target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
-                self.logger.warning(f"[{thread_id}] IPv6 detected: may not work without IPv6 on server")
+                self.logger.warning(f"[{thread_id}] IPv6 may not work without IPv6 on server")
             else:
                 self.logger.error(f"[{thread_id}] Unsupported address type: {atyp}")
                 local_conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -150,7 +158,7 @@ class SocksToHttpTunnel:
                 local_conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
                 
         except socket.timeout:
-            self.logger.error(f"[{thread_id}] Handshake timeout with {client_str}")
+            self.logger.error(f"[{thread_id}] Handshake timeout")
         except Exception as e:
             self.logger.error(f"[{thread_id}] Error: {e}")
         finally:
@@ -158,7 +166,7 @@ class SocksToHttpTunnel:
                 local_conn.close()
             except:
                 pass
-            self.logger.info(f"[{thread_id}] Closed: {client_str} -> {target_host}:{target_port}")
+            self.logger.info(f"[{thread_id}] Closed: {target_host}:{target_port}")
     
     def _handle_tcp_connect(self, local_conn, client_addr, target_host, target_port, thread_id):
         """Handle TCP CONNECT through HTTP tunnel."""
@@ -303,7 +311,7 @@ class SocksToHttpTunnel:
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             
             if resp_data.get("status") != "ok":
-                self.logger.error(f"[{thread_id}] UDP session failed: {resp_data.get('reason', 'Unknown')}")
+                self.logger.error(f"[{thread_id}] UDP session failed")
                 local_conn.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
             
@@ -393,8 +401,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"Server: {self.server_url}")
         if self.proxies:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"Max: {self.max_bytes}B, Heartbeat: {self.heartbeat_interval}s, Batch: {self.batch_wait}s")
-        self.logger.info(f"Log level: {self.config.get('log_level', 'INFO')}")
+        self.logger.info(f"HTTP timeout: {self.http_timeout}s, Heartbeat: {self.heartbeat_interval}s, Batch: {self.batch_wait}s")
         
         try:
             while self.running:

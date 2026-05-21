@@ -14,8 +14,8 @@ from common import TunnelCrypto, generate_config_wizard, setup_logging, PROTO_TC
 class TunnelHandler(BaseHTTPRequestHandler):
     crypto = None
     max_post_bytes = 5242880
-    timeout = 30
-    udp_timeout = 60
+    timeout = 60
+    udp_timeout = 120
     sessions = {}
     sessions_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=50)
@@ -25,7 +25,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
         client = self.client_address[0]
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            self.logger.debug(f"[{client}] POST: {content_length}B")
             
             if content_length > self.max_post_bytes:
                 self.logger.warning(f"[{client}] Payload too large: {content_length}")
@@ -57,9 +56,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 session_id = parts[0].decode('ascii', errors='ignore')
                 message = parts[1] if len(parts) > 1 else b""
                 
-                msg_type = "UDP" if message.startswith(b"UDP:") else "TCP"
-                msg_size = len(message)
-                
                 if session_id in self.sessions:
                     if message.startswith(b"UDP:"):
                         self._handle_udp_data(client, session_id, message[4:])
@@ -88,7 +84,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
         # Check if it's an IPv6 address
         try:
             socket.inet_pton(socket.AF_INET6, host)
-            self.logger.debug(f"IPv6 detected")
             try:
                 sock = socket.create_connection((host, port), timeout=10)
                 self.logger.info(f"IPv6 connected")
@@ -104,11 +99,8 @@ class TunnelHandler(BaseHTTPRequestHandler):
             addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
             addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
             
-            self.logger.debug(f"Found {len(addrs)} addresses")
-            
             for family, socktype, proto, canonname, sockaddr in addrs:
                 try:
-                    self.logger.debug(f"Trying {sockaddr}")
                     sock = socket.socket(family, socktype, proto)
                     sock.settimeout(10)
                     sock.connect(sockaddr)
@@ -286,7 +278,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 del self.sessions[session_id]
     
     def log_message(self, format, *args):
-        # Only log non-200 responses
         if args and "200" not in str(args[0]):
             self.logger.debug(f"[{self.client_address[0]}] {format % args}")
 
@@ -321,9 +312,6 @@ class SessionCleaner(threading.Thread):
                     except:
                         pass
                     del self.handler_class.sessions[sid]
-                
-                if stale:
-                    self.logger.debug(f"Cleaned {len(stale)} sessions, {len(self.handler_class.sessions)} remain")
 
 def run_server(config_path="server_config.json"):
     if not os.path.exists(config_path):
@@ -335,6 +323,13 @@ def run_server(config_path="server_config.json"):
     with open(config_path) as f:
         config = json.load(f)
     
+    # Set defaults for missing config options
+    config.setdefault("timeout", 60)
+    config.setdefault("udp_timeout", 120)
+    config.setdefault("max_post_bytes", 5242880)
+    config.setdefault("cleanup_interval", 30)
+    config.setdefault("log_level", "INFO")
+    
     # Setup logging
     logger = setup_logging(config, "server")
     logger.info("Loading configuration...")
@@ -344,7 +339,7 @@ def run_server(config_path="server_config.json"):
     TunnelHandler.crypto = TunnelCrypto(config["encryption_key"])
     TunnelHandler.max_post_bytes = config["max_post_bytes"]
     TunnelHandler.timeout = config["timeout"]
-    TunnelHandler.udp_timeout = config.get("udp_timeout", 60)
+    TunnelHandler.udp_timeout = config["udp_timeout"]
     
     cleanup_interval = config.get("cleanup_interval", 30)
     cleaner = SessionCleaner(TunnelHandler, cleanup_interval)
@@ -355,8 +350,7 @@ def run_server(config_path="server_config.json"):
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     logger.info(f"Listening on {host}:{port}")
-    logger.info(f"Max POST: {config['max_post_bytes']}B, TCP timeout: {config['timeout']}s, UDP timeout: {config.get('udp_timeout', 60)}s")
-    logger.info(f"Log level: {config.get('log_level', 'INFO')}")
+    logger.info(f"TCP timeout: {config['timeout']}s, UDP timeout: {config['udp_timeout']}s")
     
     try:
         server.serve_forever()
