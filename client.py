@@ -4,6 +4,7 @@ import threading
 import time
 import select
 import os
+import sys
 import requests
 from common import TunnelCrypto, generate_config_wizard
 
@@ -37,82 +38,136 @@ class SocksToHttpTunnel:
         self.socks_port = int(socks_addr[1])
         
         self.running = True
+        self.session = requests.Session()  # Reuse HTTP connections
+        self.session.headers.update({"Content-Type": "text/plain"})
 
     def _http_post(self, body: str) -> str:
-        """Send POST and return text response body with retry logic."""
+        """Send POST with retry logic."""
+        last_error = None
         for attempt in range(3):
             try:
-                resp = requests.post(
+                resp = self.session.post(
                     self.server_url,
                     data=body,
-                    headers={"Content-Type": "text/plain"},
                     proxies=self.proxies if self.proxies else None,
                     timeout=self.http_timeout
                 )
                 resp.raise_for_status()
                 return resp.text
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                print(f"HTTP timeout (attempt {attempt + 1}/3)")
+            except requests.exceptions.ConnectionError as e:
+                last_error = e
+                print(f"HTTP connection error (attempt {attempt + 1}/3): {e}")
             except Exception as e:
-                if attempt == 2:
-                    raise
+                last_error = e
+                print(f"HTTP error (attempt {attempt + 1}/3): {e}")
+            
+            if attempt < 2:
                 time.sleep(self.reconnect_delay * (attempt + 1))
+        
+        raise last_error
     
     def handle_socks_connection(self, local_conn: socket.socket):
         """Handle SOCKS5 connection and tunnel it through HTTP."""
         session_id = None
+        target_host = None
+        target_port = None
+        
         try:
             # SOCKS5 handshake
             local_conn.settimeout(10)
+            
+            # Greeting
             ver, nmethods = local_conn.recv(2)
+            if ver != 5:
+                print(f"Invalid SOCKS version: {ver}")
+                local_conn.close()
+                return
             methods = local_conn.recv(nmethods)
             local_conn.sendall(b"\x05\x00")  # No authentication
             
-            # SOCKS5 request
-            ver, cmd, rsv, atyp = local_conn.recv(4)
+            # Request
+            data = local_conn.recv(4)
+            if len(data) < 4:
+                local_conn.close()
+                return
+            ver, cmd, rsv, atyp = data
             if cmd != 1:  # CONNECT only
+                print(f"Unsupported SOCKS command: {cmd}")
+                # Send error
+                local_conn.sendall(b"\x05\x07\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
                 local_conn.close()
                 return
             
             # Parse target address
             if atyp == 1:  # IPv4
-                addr = socket.inet_ntoa(local_conn.recv(4))
+                addr_data = local_conn.recv(4)
+                if len(addr_data) < 4:
+                    local_conn.close()
+                    return
+                target_host = socket.inet_ntoa(addr_data)
             elif atyp == 3:  # Domain name
-                length = local_conn.recv(1)[0]
-                addr = local_conn.recv(length).decode()
+                length_data = local_conn.recv(1)
+                if not length_data:
+                    local_conn.close()
+                    return
+                length = length_data[0]
+                target_host = local_conn.recv(length).decode()
             else:
+                print(f"Unsupported address type: {atyp}")
+                local_conn.sendall(b"\x05\x08\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
                 local_conn.close()
                 return
-            port = int.from_bytes(local_conn.recv(2), 'big')
             
-            print(f"SOCKS5 connect request: {addr}:{port}")
+            port_data = local_conn.recv(2)
+            if len(port_data) < 2:
+                local_conn.close()
+                return
+            target_port = int.from_bytes(port_data, 'big')
             
-            # Send success response
+            print(f"SOCKS5 connect: {target_host}:{target_port}")
+            
+            # Send success response immediately
             local_conn.sendall(
                 b"\x05\x00\x00\x01" + 
                 socket.inet_aton("0.0.0.0") + 
-                port.to_bytes(2, 'big')
+                target_port.to_bytes(2, 'big')
             )
             
             # Establish tunnel with server
-            connect_msg = f'{{"type": "connect", "host": "{addr}", "port": {port}}}'
+            connect_msg = json.dumps({
+                "type": "connect",
+                "host": target_host,
+                "port": target_port
+            })
+            
             enc_connect = self.crypto.encrypt(connect_msg.encode())
             resp = self._http_post(enc_connect)
-            data = json.loads(self.crypto.decrypt(resp).decode())
+            resp_data = json.loads(self.crypto.decrypt(resp).decode())
             
-            if data.get("status") != "ok":
-                print(f"Server refused connection: {data}")
+            if resp_data.get("status") != "ok":
+                print(f"Server refused connection: {resp_data}")
                 local_conn.close()
                 return
             
-            session_id = data["session"]
-            print(f"Tunnel established: {session_id}")
+            session_id = resp_data["session"]
+            print(f"Tunnel established: {session_id} -> {target_host}:{target_port}")
             
             # Data relay loop
             local_conn.setblocking(False)
             buffer_out = b""
             last_send = time.time()
+            last_heartbeat_response = time.time()
             
             while self.running and session_id:
                 now = time.time()
+                
+                # Check for heartbeat timeout (no response for 30s)
+                if now - last_heartbeat_response > 30:
+                    print(f"Session {session_id}: Heartbeat timeout, reconnecting...")
+                    break
                 
                 # Read from local application
                 try:
@@ -120,7 +175,8 @@ class SocksToHttpTunnel:
                         chunk = local_conn.recv(8192)
                         if not chunk:
                             # Local app closed connection
-                            self._send_close(session_id)
+                            print(f"Session {session_id}: Local app disconnected")
+                            self._send_message(session_id, b"CLOSE")
                             local_conn.close()
                             return
                         buffer_out += chunk
@@ -128,7 +184,8 @@ class SocksToHttpTunnel:
                             break
                 except BlockingIOError:
                     pass
-                except (ConnectionResetError, BrokenPipeError):
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    print(f"Session {session_id}: Local connection error: {e}")
                     break
                 
                 # Determine if we should send
@@ -144,89 +201,79 @@ class SocksToHttpTunnel:
                 )
                 
                 if force_send or heartbeat:
-                    # Prepare payload
                     if len(buffer_out) > 0:
                         payload = buffer_out[:self.max_bytes - 2000]
                         buffer_out = buffer_out[self.max_bytes - 2000:]
                     else:
                         payload = b"HEARTBEAT"
                     
-                    # Prefix with session_id
-                    message = session_id.encode() + b"::" + payload
-                    enc_message = self.crypto.encrypt(message)
-                    
                     try:
-                        resp_text = self._http_post(enc_message)
+                        response = self._send_message(session_id, payload)
+                        last_heartbeat_response = time.time()
+                        
+                        if response == b"destination_closed":
+                            print(f"Session {session_id}: Destination closed")
+                            try:
+                                local_conn.sendall(response)
+                            except:
+                                pass
+                            break
+                        elif response == b"invalid_session":
+                            print(f"Session {session_id}: Invalid session, reconnecting...")
+                            break
+                        elif response and response != b"closed":
+                            # Forward response to local app
+                            try:
+                                local_conn.sendall(response)
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                print(f"Session {session_id}: Local write error")
+                                break
+                        
+                        last_send = now
+                        
                     except Exception as e:
-                        print(f"HTTP POST error: {e}, reconnecting...")
+                        print(f"Session {session_id}: HTTP error: {e}")
                         time.sleep(self.reconnect_delay)
                         continue
-                    
-                    try:
-                        plain = self.crypto.decrypt(resp_text)
-                    except Exception:
-                        print("Decryption failed")
-                        continue
-                    
-                    # Handle server messages
-                    if plain == b"destination_closed":
-                        print("Destination closed connection")
-                        break
-                    elif plain == b"invalid_session":
-                        print("Session expired, reconnecting...")
-                        # Re-establish session
-                        enc_connect = self.crypto.encrypt(connect_msg.encode())
-                        resp = self._http_post(enc_connect)
-                        data = json.loads(self.crypto.decrypt(resp).decode())
-                        if data.get("status") == "ok":
-                            session_id = data["session"]
-                            # Resend buffered data
-                            if buffer_out:
-                                message = session_id.encode() + b"::" + buffer_out
-                                enc_message = self.crypto.encrypt(message)
-                                self._http_post(enc_message)
-                                buffer_out = b""
-                        continue
-                    elif plain and plain != b"closed":
-                        # Write to local application
-                        try:
-                            local_conn.sendall(plain)
-                        except (BrokenPipeError, ConnectionResetError):
-                            break
-                    
-                    last_send = now
                 
                 # Small sleep to prevent busy-waiting
                 time.sleep(0.001)
                 
         except Exception as e:
-            print(f"Tunnel error: {e}")
+            print(f"Tunnel error for {target_host}:{target_port}: {e}")
         finally:
             if session_id:
                 try:
-                    self._send_close(session_id)
+                    self._send_message(session_id, b"CLOSE")
                 except:
                     pass
             try:
                 local_conn.close()
             except:
                 pass
+            if target_host:
+                print(f"Tunnel closed: {target_host}:{target_port}")
     
-    def _send_close(self, session_id):
-        """Send close message to server."""
-        try:
-            message = session_id.encode() + b"::CLOSE"
-            enc_message = self.crypto.encrypt(message)
-            self._http_post(enc_message)
-        except:
-            pass
+    def _send_message(self, session_id, message):
+        """Send a session message and return decrypted response."""
+        # Handle the CONNECT message separately
+        if isinstance(message, dict):
+            payload = json.dumps(message).encode()
+            enc_message = self.crypto.encrypt(payload)
+        else:
+            # Regular session message
+            session_message = session_id.encode() + b"::" + message
+            enc_message = self.crypto.encrypt(session_message)
+        
+        resp_text = self._http_post(enc_message)
+        return self.crypto.decrypt(resp_text)
     
     def start(self):
         """Start SOCKS5 listener."""
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind((self.socks_host, self.socks_port))
-        server_sock.listen(5)
+        server_sock.listen(10)
         print(f"SOCKS5 tunnel listening on {self.socks_host}:{self.socks_port}")
         print(f"Tunnel server: {self.server_url}")
         if self.proxies:
@@ -234,13 +281,18 @@ class SocksToHttpTunnel:
         
         try:
             while self.running:
-                conn, addr = server_sock.accept()
-                print(f"New SOCKS5 connection from {addr}")
-                threading.Thread(
-                    target=self.handle_socks_connection, 
-                    args=(conn,), 
-                    daemon=True
-                ).start()
+                try:
+                    conn, addr = server_sock.accept()
+                    print(f"New connection from {addr}")
+                    thread = threading.Thread(
+                        target=self.handle_socks_connection, 
+                        args=(conn,), 
+                        daemon=True
+                    )
+                    thread.start()
+                except Exception as e:
+                    if self.running:
+                        print(f"Accept error: {e}")
         except KeyboardInterrupt:
             print("\nShutting down...")
             self.running = False

@@ -6,7 +6,6 @@ from cryptography.fernet import Fernet
 
 class TunnelCrypto:
     def __init__(self, key: str):
-        # Derive a proper Fernet key from PSK using SHA256
         key_bytes = hashlib.sha256(key.encode()).digest()
         fernet_key = base64.urlsafe_b64encode(key_bytes)
         self.fernet = Fernet(fernet_key)
@@ -20,7 +19,6 @@ class TunnelCrypto:
         return self.fernet.decrypt(encrypted)
 
 def generate_config_wizard(config_path, config_type="client"):
-    """Interactive wizard to generate config file."""
     if os.path.exists(config_path):
         overwrite = input(f"Config {config_path} already exists. Overwrite? (y/N): ").lower()
         if overwrite != 'y':
@@ -28,7 +26,6 @@ def generate_config_wizard(config_path, config_type="client"):
     
     config = {}
     
-    # PSK key
     print("\n=== Encryption Key ===")
     print("Enter a pre-shared key (or press Enter for random generated):")
     psk = input("PSK Key: ").strip()
@@ -39,22 +36,19 @@ def generate_config_wizard(config_path, config_type="client"):
     config["encryption_key"] = psk
     
     if config_type == "server":
-        # Server config
         print("\n=== Server Configuration ===")
         listen_addr = input("Listen address [0.0.0.0:8080]: ").strip()
         config["listen"] = listen_addr if listen_addr else "0.0.0.0:8080"
         
         max_bytes = input("Max POST bytes [5242880]: ").strip()
-        config["max_post_bytes"] = int(max_bytes) if max_bytes else 5242880  # 5MB
+        config["max_post_bytes"] = int(max_bytes) if max_bytes else 5242880
         
         timeout = input("Connection timeout in seconds [30]: ").strip()
         config["timeout"] = float(timeout) if timeout else 30
         
         cleanup_interval = input("Session cleanup interval in seconds [60]: ").strip()
         config["cleanup_interval"] = float(cleanup_interval) if cleanup_interval else 60
-        
     else:
-        # Client config
         print("\n=== Client Configuration ===")
         socks_addr = input("SOCKS5 listen address [127.0.0.1:1080]: ").strip()
         config["socks_listen"] = socks_addr if socks_addr else "127.0.0.1:1080"
