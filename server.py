@@ -9,7 +9,28 @@ import struct
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from common import TunnelCrypto, generate_server_config, setup_logging, PROTO_TCP, PROTO_UDP
+from common import TunnelCrypto, generate_server_config, setup_logging, PROTO_TCP, PROTO_UDP, compress_data, decompress_data, COMPRESS_ZLIB, StreamManager
+
+class ConnectionPool:
+    """Manages persistent connections for HTTP keep-alive."""
+    def __init__(self, max_connections=50):
+        self.max_connections = max_connections
+        self.active_connections = 0
+        self.lock = threading.Lock()
+    
+    def acquire(self):
+        """Acquire connection slot."""
+        with self.lock:
+            if self.active_connections < self.max_connections:
+                self.active_connections += 1
+                return True
+            return False
+    
+    def release(self):
+        """Release connection slot."""
+        with self.lock:
+            if self.active_connections > 0:
+                self.active_connections -= 1
 
 class TunnelHandler(BaseHTTPRequestHandler):
     crypto = None
@@ -20,6 +41,11 @@ class TunnelHandler(BaseHTTPRequestHandler):
     sessions_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=50)
     logger = None
+    connection_pool = ConnectionPool()
+    stream_manager = StreamManager()
+    compression = True
+    compress_method = COMPRESS_ZLIB
+    compress_threshold = 100
     
     def do_POST(self):
         client = self.client_address[0]
@@ -46,6 +72,10 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 if isinstance(msg, dict) and msg.get("type") == "connect":
                     self.logger.info(f"[{client}] CONNECT to {msg.get('host')}:{msg.get('port')}")
                     self._handle_connect(msg)
+                    return
+                elif isinstance(msg, dict) and msg.get("type") == "ping":
+                    # Health check response
+                    self._send_encrypted(b"pong")
                     return
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
@@ -146,7 +176,8 @@ class TunnelHandler(BaseHTTPRequestHandler):
                     'created': time.time(),
                     'bytes_sent': 0,
                     'bytes_received': 0,
-                    'requests': 0
+                    'requests': 0,
+                    'idle_count': 0
                 }
             
             resp = json.dumps({"status": "ok", "session": session_id, "proto": proto})
@@ -176,6 +207,14 @@ class TunnelHandler(BaseHTTPRequestHandler):
             self._close_session(session_id)
             self._send_encrypted(b"closed")
             return
+        
+        # Decompress incoming data if needed
+        if message and message != b"HEARTBEAT" and message != b"CLOSE":
+            if self.compression:
+                try:
+                    message = decompress_data(message)
+                except Exception as e:
+                    self.logger.warning(f"[{client}] Decompression failed: {e}")
         
         # Forward data to destination
         if message and message != b"HEARTBEAT":
@@ -213,6 +252,14 @@ class TunnelHandler(BaseHTTPRequestHandler):
             self._close_session(session_id)
             response_data = b"destination_closed"
         
+        # Compress response if needed
+        if response_data and response_data != b"destination_closed":
+            if self.compression:
+                try:
+                    response_data = compress_data(response_data, self.compress_method, self.compress_threshold)
+                except Exception as e:
+                    self.logger.warning(f"[{client}] Compression failed: {e}")
+        
         self._send_encrypted(response_data if response_data else b"")
     
     def _handle_udp_data(self, client, session_id, data):
@@ -246,6 +293,14 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 session['bytes_received'] += len(data)
         except (BlockingIOError, socket.error):
             pass
+        
+        # Compress response if needed
+        if response_data:
+            if self.compression:
+                try:
+                    response_data = compress_data(response_data, self.compress_method, self.compress_threshold)
+                except Exception as e:
+                    self.logger.warning(f"[{client}] Compression failed: {e}")
         
         self._send_encrypted(response_data if response_data else b"")
     
@@ -301,8 +356,18 @@ class SessionCleaner(threading.Thread):
                     else:
                         timeout = self.handler_class.tcp_timeout
                     
+                    # Adaptive timeout based on activity pattern
                     age = now - s['last_active']
-                    if age > timeout:
+                    if 'idle_count' not in s:
+                        s['idle_count'] = 0
+                    
+                    if age > timeout * 0.5:
+                        s['idle_count'] += 1
+                    else:
+                        s['idle_count'] = 0
+                    
+                    # Remove if truly stale (inactive > timeout with idle count)
+                    if age > timeout and s['idle_count'] > 3:
                         stale.append((sid, age, s['proto'], s.get('requests', 0)))
                 
                 for sid, age, proto, reqs in stale:
@@ -329,6 +394,8 @@ def run_server(config_path="server_config.json"):
     config.setdefault("udp_timeout", 120)
     config.setdefault("cleanup_interval", 30)
     config.setdefault("log_level", "INFO")
+    config.setdefault("compression", True)
+    config.setdefault("compress_threshold", 100)
     
     # Setup logging
     logger = setup_logging(config, "server")
@@ -340,6 +407,12 @@ def run_server(config_path="server_config.json"):
     TunnelHandler.max_post_bytes = config["max_post_bytes"]
     TunnelHandler.tcp_timeout = config["tcp_timeout"]
     TunnelHandler.udp_timeout = config["udp_timeout"]
+    
+    # Compression settings
+    TunnelHandler.compression = config.get("compression", True)
+    TunnelHandler.compress_method = COMPRESS_ZLIB
+    TunnelHandler.compress_threshold = config.get("compress_threshold", 100)
+    logger.info(f"Compression: {'enabled' if TunnelHandler.compression else 'disabled'}")
     
     cleanup_interval = config.get("cleanup_interval", 30)
     cleaner = SessionCleaner(TunnelHandler, cleanup_interval)

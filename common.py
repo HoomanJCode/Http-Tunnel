@@ -3,6 +3,11 @@ import os
 import base64
 import hashlib
 import logging
+import time
+import threading
+import queue
+import uuid
+import zlib
 from cryptography.fernet import Fernet
 
 class TunnelCrypto:
@@ -34,6 +39,81 @@ def setup_logging(config, name="tunnel"):
 # Protocol constants
 PROTO_TCP = 1
 PROTO_UDP = 2
+
+# Compression constants
+COMPRESS_NONE = 0
+COMPRESS_ZLIB = 1
+COMPRESS_LZ4 = 2  # Future support
+
+def compress_data(data: bytes, method=COMPRESS_ZLIB, threshold=100) -> bytes:
+    """Compress data if beneficial."""
+    if method == COMPRESS_NONE or len(data) < threshold:
+        return b'\x00' + data  # No compression marker
+    
+    if method == COMPRESS_ZLIB:
+        compressed = zlib.compress(data, 6)
+        if len(compressed) < len(data):
+            return b'\x01' + compressed  # Compressed marker
+        return b'\x00' + data  # Compression didn't help
+    
+    return b'\x00' + data
+
+def decompress_data(data: bytes) -> bytes:
+    """Decompress data based on marker byte."""
+    if not data:
+        return data
+    
+    marker = data[0]
+    payload = data[1:]
+    
+    if marker == 0x00:  # No compression
+        return payload
+    elif marker == 0x01:  # Zlib compressed
+        return zlib.decompress(payload)
+    else:
+        return payload  # Unknown marker, return as-is
+
+class StreamManager:
+    """Manages multiple logical streams over single physical connection."""
+    def __init__(self):
+        self.streams = {}
+        self.lock = threading.Lock()
+    
+    def create_stream(self):
+        """Create new stream ID."""
+        stream_id = str(uuid.uuid4())[:8]
+        with self.lock:
+            self.streams[stream_id] = {
+                'buffer': queue.Queue(),
+                'created': time.time(),
+                'last_active': time.time()
+            }
+        return stream_id
+    
+    def close_stream(self, stream_id):
+        """Close and cleanup stream."""
+        with self.lock:
+            if stream_id in self.streams:
+                del self.streams[stream_id]
+    
+    def send_data(self, stream_id, data):
+        """Queue data for stream."""
+        with self.lock:
+            if stream_id in self.streams:
+                self.streams[stream_id]['buffer'].put(data)
+                self.streams[stream_id]['last_active'] = time.time()
+    
+    def receive_data(self, stream_id, timeout=0.1):
+        """Receive data from stream buffer."""
+        with self.lock:
+            if stream_id in self.streams:
+                try:
+                    data = self.streams[stream_id]['buffer'].get(timeout=timeout)
+                    self.streams[stream_id]['last_active'] = time.time()
+                    return data
+                except queue.Empty:
+                    return None
+        return None
 
 def generate_server_config(config_path="server_config.json"):
     """Generate server configuration file."""
@@ -74,6 +154,13 @@ def generate_server_config(config_path="server_config.json"):
     
     cleanup_interval = input("Session cleanup interval in seconds [30]: ").strip()
     config["cleanup_interval"] = float(cleanup_interval) if cleanup_interval else 30
+    
+    # Compression settings
+    compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
+    config["compression"] = compress != 'n'
+    
+    compress_threshold = input("Compression threshold in bytes [100]: ").strip()
+    config["compress_threshold"] = int(compress_threshold) if compress_threshold else 100
     
     # Logging
     print("\n--- Logging ---")
@@ -136,6 +223,13 @@ def generate_client_config(config_path="client_config.json"):
     
     reconnect_delay = input("Reconnect delay in seconds [0.5]: ").strip()
     config["reconnect_delay"] = float(reconnect_delay) if reconnect_delay else 0.5
+    
+    # Compression settings
+    compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
+    config["compression"] = compress != 'n'
+    
+    compress_threshold = input("Compression threshold in bytes [100]: ").strip()
+    config["compress_threshold"] = int(compress_threshold) if compress_threshold else 100
     
     # Bypass configuration
     print("\n--- Bypass Configuration ---")
