@@ -109,11 +109,13 @@ class StreamManager:
                 except queue.Empty:
                     return None
         return None
+# Use a special sentinel for required parameters
+_REQUIRED = object()
 
 # Define valid parameters for each config type
 SERVER_CONFIG_PARAMS = {
-    "encryption_key": True,
-    "listen": True,
+    "encryption_key": _REQUIRED,
+    "listen": _REQUIRED,
     "max_post_bytes": 5242880,
     "tcp_timeout": 60,
     "udp_timeout": 120,
@@ -123,9 +125,9 @@ SERVER_CONFIG_PARAMS = {
 }
 
 CLIENT_CONFIG_PARAMS = {
-    "encryption_key": True,
-    "socks_listen": True,
-    "server_url": True,
+    "encryption_key": _REQUIRED,
+    "socks_listen": _REQUIRED,
+    "server_url": _REQUIRED,
     "outbound_http_proxy": "",
     "max_post_bytes": 5242880,
     "http_timeout": 30,
@@ -150,9 +152,11 @@ def clean_config(config, config_type="client"):
     for param, default in valid_params.items():
         if param in config:
             cleaned[param] = config[param]
-        elif default is True:
+        elif default is _REQUIRED:
+            # Required parameter missing - set to None
             cleaned[param] = None
         else:
+            # Optional parameter with default value (can be True, False, string, int, etc.)
             cleaned[param] = default
     
     return cleaned
