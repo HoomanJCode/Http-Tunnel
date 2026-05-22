@@ -3,11 +3,11 @@ import os
 import base64
 import hashlib
 import logging
-import time
+import zlib
 import threading
+import time
 import queue
 import uuid
-import zlib
 from cryptography.fernet import Fernet
 
 class TunnelCrypto:
@@ -43,18 +43,17 @@ PROTO_UDP = 2
 # Compression constants
 COMPRESS_NONE = 0
 COMPRESS_ZLIB = 1
-COMPRESS_LZ4 = 2  # Future support
 
 def compress_data(data: bytes, method=COMPRESS_ZLIB, threshold=100) -> bytes:
     """Compress data if beneficial."""
     if method == COMPRESS_NONE or len(data) < threshold:
-        return b'\x00' + data  # No compression marker
+        return b'\x00' + data
     
     if method == COMPRESS_ZLIB:
         compressed = zlib.compress(data, 6)
         if len(compressed) < len(data):
-            return b'\x01' + compressed  # Compressed marker
-        return b'\x00' + data  # Compression didn't help
+            return b'\x01' + compressed
+        return b'\x00' + data
     
     return b'\x00' + data
 
@@ -66,12 +65,12 @@ def decompress_data(data: bytes) -> bytes:
     marker = data[0]
     payload = data[1:]
     
-    if marker == 0x00:  # No compression
+    if marker == 0x00:
         return payload
-    elif marker == 0x01:  # Zlib compressed
+    elif marker == 0x01:
         return zlib.decompress(payload)
     else:
-        return payload  # Unknown marker, return as-is
+        return payload
 
 class StreamManager:
     """Manages multiple logical streams over single physical connection."""
@@ -126,7 +125,6 @@ def generate_server_config(config_path="server_config.json"):
     
     print("\n=== Server Configuration Wizard ===\n")
     
-    # Encryption key
     print("--- Encryption ---")
     print("Enter a pre-shared key (or press Enter for random generated):")
     psk = input("PSK Key: ").strip()
@@ -136,12 +134,10 @@ def generate_server_config(config_path="server_config.json"):
         print(f"Generated random PSK: {psk}")
     config["encryption_key"] = psk
     
-    # Listen address
     print("\n--- Network ---")
     listen_addr = input("Listen address [0.0.0.0:8080]: ").strip()
     config["listen"] = listen_addr if listen_addr else "0.0.0.0:8080"
     
-    # Performance settings with defaults
     print("\n--- Performance (press Enter for defaults) ---")
     max_bytes = input("Max POST bytes [5242880]: ").strip()
     config["max_post_bytes"] = int(max_bytes) if max_bytes else 5242880
@@ -155,14 +151,9 @@ def generate_server_config(config_path="server_config.json"):
     cleanup_interval = input("Session cleanup interval in seconds [30]: ").strip()
     config["cleanup_interval"] = float(cleanup_interval) if cleanup_interval else 30
     
-    # Compression settings
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
-    compress_threshold = input("Compression threshold in bytes [100]: ").strip()
-    config["compress_threshold"] = int(compress_threshold) if compress_threshold else 100
-    
-    # Logging
     print("\n--- Logging ---")
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
@@ -170,7 +161,7 @@ def generate_server_config(config_path="server_config.json"):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
     
-    print(f"\n✓ Server configuration saved to {config_path}")
+    print(f"\nServer configuration saved to {config_path}")
     return True
 
 def generate_client_config(config_path="client_config.json"):
@@ -184,7 +175,6 @@ def generate_client_config(config_path="client_config.json"):
     
     print("\n=== Client Configuration Wizard ===\n")
     
-    # Encryption key
     print("--- Encryption ---")
     print("Enter a pre-shared key (or press Enter for random generated):")
     psk = input("PSK Key: ").strip()
@@ -194,12 +184,10 @@ def generate_client_config(config_path="client_config.json"):
         print(f"Generated random PSK: {psk}")
     config["encryption_key"] = psk
     
-    # SOCKS5 settings
     print("\n--- SOCKS5 Proxy ---")
     socks_addr = input("SOCKS5 listen address [127.0.0.1:1080]: ").strip()
     config["socks_listen"] = socks_addr if socks_addr else "127.0.0.1:1080"
     
-    # Server connection
     print("\n--- Server Connection ---")
     server_url = input("Server URL [http://localhost:8080/tunnel]: ").strip()
     config["server_url"] = server_url if server_url else "http://localhost:8080/tunnel"
@@ -207,7 +195,11 @@ def generate_client_config(config_path="client_config.json"):
     outbound_proxy = input("Outbound HTTP proxy (leave empty for none): ").strip()
     config["outbound_http_proxy"] = outbound_proxy if outbound_proxy else ""
     
-    # Performance settings with defaults
+    # DNS configuration
+    print("\n--- DNS Configuration ---")
+    dns_mode = input("DNS resolution mode (local/server) [server]: ").strip().lower()
+    config["dns_mode"] = dns_mode if dns_mode in ["local", "server"] else "server"
+    
     print("\n--- Performance (press Enter for defaults) ---")
     max_bytes = input("Max POST bytes [5242880]: ").strip()
     config["max_post_bytes"] = int(max_bytes) if max_bytes else 5242880
@@ -224,30 +216,13 @@ def generate_client_config(config_path="client_config.json"):
     reconnect_delay = input("Reconnect delay in seconds [0.5]: ").strip()
     config["reconnect_delay"] = float(reconnect_delay) if reconnect_delay else 0.5
     
-    # Compression settings
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
-    compress_threshold = input("Compression threshold in bytes [100]: ").strip()
-    config["compress_threshold"] = int(compress_threshold) if compress_threshold else 100
-    
-    # Bypass configuration
     print("\n--- Bypass Configuration ---")
-    print("Enter IP ranges to bypass tunnel (comma-separated, CIDR notation)")
-    print("Examples: 192.168.0.0/16,10.0.0.0/8,127.0.0.0/8")
-    bypass_input = input("Bypass ranges [127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]: ").strip()
-    if bypass_input:
-        config["bypass_ranges"] = [r.strip() for r in bypass_input.split(",")]
-    else:
-        config["bypass_ranges"] = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-    
-    bypass_local = input("Bypass localhost requests? (Y/n): ").strip().lower()
+    bypass_local = input("Bypass localhost requests? (Y/n) [Y]: ").strip().lower()
     config["bypass_local"] = bypass_local != 'n'
     
-    bypass_private = input("Bypass all private networks? (Y/n): ").strip().lower()
-    config["bypass_private"] = bypass_private != 'n'
-    
-    # Logging
     print("\n--- Logging ---")
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
@@ -255,12 +230,5 @@ def generate_client_config(config_path="client_config.json"):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
     
-    print(f"\n✓ Client configuration saved to {config_path}")
+    print(f"\nClient configuration saved to {config_path}")
     return True
-
-def generate_config_wizard(config_path, config_type="client"):
-    """Legacy wrapper for backward compatibility."""
-    if config_type == "server":
-        return generate_server_config(config_path)
-    else:
-        return generate_client_config(config_path)
