@@ -19,14 +19,23 @@ fi
 
 # Run based on argument
 if [ "$1" == "client" ]; then
-    echo "Starting client..."
+    echo "Starting tunnel client..."
     python3 client.py
 elif [ "$1" == "server" ]; then
-    echo "Starting server..."
+    echo "Starting tunnel server..."
     python3 server.py
 else
+    echo "HTTP Tunnel - TCP/UDP over HTTP POST"
+    echo ""
     echo "Usage: ./run.sh [server|client]"
     echo "  server - Start the tunnel server"
-    echo "  client - Start the tunnel client"
+    echo "  client - Start the tunnel client (SOCKS5 proxy)"
+    echo ""
+    echo "Examples:"
+    echo "  ./run.sh server"
+    echo "  ./run.sh client"
+    echo ""
+    echo "After starting client, use with curl:"
+    echo "  curl --socks5-hostname 127.0.0.1:1080 --ipv4 https://example.com"
     exit 1
 fi
