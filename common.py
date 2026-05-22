@@ -114,6 +114,88 @@ class StreamManager:
                     return None
         return None
 
+# Define valid parameters for each config type
+SERVER_CONFIG_PARAMS = {
+    "encryption_key": True,      # Required
+    "listen": True,              # Required
+    "max_post_bytes": 5242880,
+    "tcp_timeout": 60,
+    "udp_timeout": 120,
+    "cleanup_interval": 30,
+    "compression": True,
+    "log_level": "INFO"
+}
+
+CLIENT_CONFIG_PARAMS = {
+    "encryption_key": True,      # Required
+    "socks_listen": True,        # Required
+    "server_url": True,          # Required
+    "outbound_http_proxy": "",
+    "max_post_bytes": 5242880,
+    "http_timeout": 30,
+    "heartbeat_interval": 1,
+    "batch_wait": 0.01,
+    "reconnect_delay": 0.5,
+    "compression": True,
+    "bypass_local": True,
+    "dns_mode": "server",
+    "log_level": "INFO"
+}
+
+def clean_config(config, config_type="client"):
+    """Clean and validate configuration.
+    - Removes parameters not valid for this config type
+    - Sets defaults for missing parameters
+    - Saves cleaned config back to file
+    Returns cleaned config dict.
+    """
+    if config_type == "server":
+        valid_params = SERVER_CONFIG_PARAMS
+    else:
+        valid_params = CLIENT_CONFIG_PARAMS
+    
+    cleaned = {}
+    
+    # Copy only valid parameters with defaults
+    for param, default in valid_params.items():
+        if param in config:
+            cleaned[param] = config[param]
+        elif default is True:
+            # Required parameter missing
+            cleaned[param] = None
+        else:
+            # Optional parameter with default
+            cleaned[param] = default
+    
+    return cleaned
+
+def save_config(config_path, config):
+    """Save configuration to file."""
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+
+def load_and_clean_config(config_path, config_type="client"):
+    """Load config, clean it, save it back, and return cleaned version."""
+    with open(config_path) as f:
+        config = json.load(f)
+    
+    original_keys = set(config.keys())
+    cleaned = clean_config(config, config_type)
+    cleaned_keys = set(cleaned.keys())
+    
+    removed = original_keys - cleaned_keys
+    added = cleaned_keys - original_keys
+    
+    if removed or added:
+        if removed:
+            print(f"Removed invalid parameters: {', '.join(removed)}")
+        if added:
+            print(f"Added missing defaults: {', '.join(added)}")
+        save_config(config_path, cleaned)
+        print(f"Configuration cleaned and saved to {config_path}")
+    
+    return cleaned
+
 def generate_server_config(config_path="server_config.json"):
     """Generate server configuration file."""
     if os.path.exists(config_path):
@@ -158,8 +240,9 @@ def generate_server_config(config_path="server_config.json"):
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
     
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=4)
+    # Clean config before saving
+    config = clean_config(config, "server")
+    save_config(config_path, config)
     
     print(f"\nServer configuration saved to {config_path}")
     return True
@@ -195,7 +278,6 @@ def generate_client_config(config_path="client_config.json"):
     outbound_proxy = input("Outbound HTTP proxy (leave empty for none): ").strip()
     config["outbound_http_proxy"] = outbound_proxy if outbound_proxy else ""
     
-    # DNS configuration
     print("\n--- DNS Configuration ---")
     dns_mode = input("DNS resolution mode (local/server) [server]: ").strip().lower()
     config["dns_mode"] = dns_mode if dns_mode in ["local", "server"] else "server"
@@ -219,7 +301,7 @@ def generate_client_config(config_path="client_config.json"):
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
-    print("\n--- Bypass Configuration ---")
+    print("\n--- Bypass ---")
     bypass_local = input("Bypass localhost requests? (Y/n) [Y]: ").strip().lower()
     config["bypass_local"] = bypass_local != 'n'
     
@@ -227,8 +309,9 @@ def generate_client_config(config_path="client_config.json"):
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
     
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=4)
+    # Clean config before saving
+    config = clean_config(config, "client")
+    save_config(config_path, config)
     
     print(f"\nClient configuration saved to {config_path}")
     return True

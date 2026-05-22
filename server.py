@@ -9,7 +9,11 @@ import struct
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from common import TunnelCrypto, generate_server_config, setup_logging, compress_data, decompress_data, COMPRESS_ZLIB, PROTO_TCP, PROTO_UDP
+from common import (
+    TunnelCrypto, generate_server_config, setup_logging, 
+    compress_data, decompress_data, COMPRESS_ZLIB, 
+    PROTO_TCP, PROTO_UDP, load_and_clean_config
+)
 
 class TunnelHandler(BaseHTTPRequestHandler):
     crypto = None
@@ -24,6 +28,8 @@ class TunnelHandler(BaseHTTPRequestHandler):
     compress_method = COMPRESS_ZLIB
     compress_threshold = 100
     
+    # ... rest of TunnelHandler class unchanged from previous version ...
+
     def do_POST(self):
         client = self.client_address[0]
         try:
@@ -84,7 +90,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
     
     def _resolve_and_connect(self, host, port):
         """Resolve hostname and connect. Handles both IP and domain names."""
-        # Check if it's already an IP address
         try:
             socket.inet_pton(socket.AF_INET, host)
             self.logger.info(f"Connecting to IPv4: {host}:{port}")
@@ -105,7 +110,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
         except socket.error:
             pass
         
-        # It's a hostname, resolve it
         self.logger.info(f"Resolving {host}:{port}...")
         try:
             addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -147,7 +151,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
             else:
                 sock = self._resolve_and_connect(host, port)
                 sock.setblocking(False)
-                # Set TCP_NODELAY to disable Nagle's algorithm for lower latency
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.logger.info(f"TCP session {session_id} for {host}:{port}")
             
@@ -162,8 +165,7 @@ class TunnelHandler(BaseHTTPRequestHandler):
                     'bytes_sent': 0,
                     'bytes_received': 0,
                     'requests': 0,
-                    'idle_count': 0,
-                    'pending_data': b''  # Buffer for data that couldn't be sent immediately
+                    'idle_count': 0
                 }
             
             resp = json.dumps({"status": "ok", "session": session_id, "proto": proto})
@@ -175,7 +177,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
             self._send_encrypted(resp.encode())
     
     def _handle_tcp_data(self, client, session_id, message):
-        """Handle TCP data messages."""
         with self.sessions_lock:
             session = self.sessions.get(session_id)
             if not session or session['proto'] != PROTO_TCP:
@@ -187,7 +188,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
         
         sock = session['socket']
         
-        # Handle control messages
         if message == b"CLOSE":
             self.logger.info(f"[{client}] Session {session_id} closed by client")
             self.logger.info(f"[{client}] Session stats: {session['requests']} req, {session['bytes_sent']}B sent, {session['bytes_received']}B recv")
@@ -195,7 +195,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
             self._send_encrypted(b"closed")
             return
         
-        # Decompress incoming data if needed
         if message and message != b"HEARTBEAT" and message != b"CLOSE":
             if self.compression:
                 try:
@@ -203,10 +202,8 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
         
-        # Forward data to destination
         if message and message != b"HEARTBEAT":
             try:
-                # Send all data, handle partial sends
                 total_sent = 0
                 while total_sent < len(message):
                     try:
@@ -217,27 +214,19 @@ class TunnelHandler(BaseHTTPRequestHandler):
                         else:
                             break
                     except BlockingIOError:
-                        # Socket buffer full, wait and retry
                         ready = select.select([], [sock], [], 0.1)
                         if not ready[1]:
                             break
-                self.logger.debug(f"[{client}] Session {session_id}: Sent {total_sent}/{len(message)} bytes to destination")
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 self.logger.error(f"[{client}] Session {session_id}: Write error: {e}")
                 self._close_session(session_id)
                 self._send_encrypted(b"destination_closed")
                 return
-            except Exception as e:
-                self.logger.error(f"[{client}] Session {session_id}: Unexpected write error: {e}")
-                self._close_session(session_id)
-                self._send_encrypted(b"destination_closed")
-                return
         
-        # Read available data immediately
         response_data = b""
         try:
             while True:
-                ready = select.select([sock], [], [], 0.01)  # Increased timeout slightly
+                ready = select.select([sock], [], [], 0.01)
                 if ready[0]:
                     try:
                         chunk = sock.recv(65536)
@@ -248,7 +237,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
                             break
                         response_data += chunk
                         session['bytes_received'] += len(chunk)
-                        self.logger.debug(f"[{client}] Session {session_id}: Received {len(chunk)} bytes from destination")
                         if len(response_data) >= self.max_post_bytes - 2000:
                             break
                     except BlockingIOError:
@@ -265,7 +253,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
             self._close_session(session_id)
             response_data = b"destination_closed"
         
-        # Compress response if needed
         if response_data and response_data != b"destination_closed" and response_data != b"closed":
             if self.compression:
                 try:
@@ -273,13 +260,9 @@ class TunnelHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
         
-        # Always send response
-        if response_data:
-            self.logger.debug(f"[{client}] Session {session_id}: Sending {len(response_data)} bytes response to client")
         self._send_encrypted(response_data if response_data else b"")
     
     def _handle_udp_data(self, client, session_id, data):
-        """Handle UDP data."""
         with self.sessions_lock:
             session = self.sessions.get(session_id)
             if not session or session['proto'] != PROTO_UDP:
@@ -291,7 +274,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
         
         sock = session['socket']
         
-        # Forward UDP packet to destination
         if data and data != b"CLOSE" and data != b"HEARTBEAT":
             try:
                 addr = (session['host'], session['port'])
@@ -300,7 +282,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.logger.error(f"[{client}] Session {session_id}: UDP send error")
         
-        # Check for incoming UDP data
         response_data = b""
         try:
             ready = select.select([sock], [], [], 0.001)
@@ -311,7 +292,6 @@ class TunnelHandler(BaseHTTPRequestHandler):
         except (BlockingIOError, socket.error):
             pass
         
-        # Compress response if needed
         if response_data:
             if self.compression:
                 try:
@@ -397,16 +377,8 @@ def run_server(config_path="server_config.json"):
             print("Setup cancelled.")
             return
     
-    with open(config_path) as f:
-        config = json.load(f)
-    
-    # Server-specific defaults
-    config.setdefault("max_post_bytes", 5242880)
-    config.setdefault("tcp_timeout", 60)
-    config.setdefault("udp_timeout", 120)
-    config.setdefault("cleanup_interval", 30)
-    config.setdefault("log_level", "INFO")
-    config.setdefault("compression", True)
+    # Load and clean config
+    config = load_and_clean_config(config_path, "server")
     
     # Setup logging
     logger = setup_logging(config, "server")
@@ -417,9 +389,9 @@ def run_server(config_path="server_config.json"):
     TunnelHandler.max_post_bytes = config["max_post_bytes"]
     TunnelHandler.tcp_timeout = config["tcp_timeout"]
     TunnelHandler.udp_timeout = config["udp_timeout"]
-    TunnelHandler.compression = config.get("compression", True)
+    TunnelHandler.compression = config["compression"]
     
-    cleanup_interval = config.get("cleanup_interval", 30)
+    cleanup_interval = config["cleanup_interval"]
     cleaner = SessionCleaner(TunnelHandler, cleanup_interval)
     cleaner.start()
     
