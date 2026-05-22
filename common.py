@@ -79,7 +79,6 @@ class StreamManager:
         self.lock = threading.Lock()
     
     def create_stream(self):
-        """Create new stream ID."""
         stream_id = str(uuid.uuid4())[:8]
         with self.lock:
             self.streams[stream_id] = {
@@ -90,20 +89,17 @@ class StreamManager:
         return stream_id
     
     def close_stream(self, stream_id):
-        """Close and cleanup stream."""
         with self.lock:
             if stream_id in self.streams:
                 del self.streams[stream_id]
     
     def send_data(self, stream_id, data):
-        """Queue data for stream."""
         with self.lock:
             if stream_id in self.streams:
                 self.streams[stream_id]['buffer'].put(data)
                 self.streams[stream_id]['last_active'] = time.time()
     
     def receive_data(self, stream_id, timeout=0.1):
-        """Receive data from stream buffer."""
         with self.lock:
             if stream_id in self.streams:
                 try:
