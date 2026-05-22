@@ -1,53 +1,55 @@
-"""Configuration management with validation and cleaning."""
+"""Configuration management with validation, cleaning, and wizard generation.
+
+Configuration is auto-cleaned on load:
+- Invalid parameters (wrong type) are removed
+- Missing optional parameters get defaults
+- Required parameters without values are set to None
+
+Server and client have separate valid parameter sets.
+"""
 
 import json
 import os
 import secrets
 
-# Sentinel for required parameters
+# Sentinel object to distinguish required params from boolean defaults
 _REQUIRED = object()
 
 # Valid server configuration parameters with defaults
 SERVER_CONFIG_PARAMS = {
-    "encryption_key": _REQUIRED,
-    "listen": _REQUIRED,
-    "max_post_bytes": 5242880,
-    "tcp_timeout": 60,
-    "udp_timeout": 120,
-    "cleanup_interval": 30,
-    "compression": True,
-    "log_level": "INFO"
+    "encryption_key": _REQUIRED,   # Must be provided
+    "listen": _REQUIRED,           # Must be provided
+    "max_post_bytes": 5242880,     # 5MB default
+    "tcp_timeout": 60,             # Session idle timeout
+    "udp_timeout": 120,            # UDP session timeout
+    "cleanup_interval": 30,        # Stale session check interval
+    "compression": True,           # Zlib compression enabled
+    "log_level": "INFO"            # Logging verbosity
 }
 
 # Valid client configuration parameters with defaults
 CLIENT_CONFIG_PARAMS = {
-    "encryption_key": _REQUIRED,
-    "socks_listen": _REQUIRED,
-    "server_url": _REQUIRED,
-    "outbound_http_proxy": "",
-    "max_post_bytes": 5242880,
-    "http_timeout": 30,
-    "heartbeat_interval": 1,
-    "batch_wait": 0.01,
-    "reconnect_delay": 0.5,
-    "compression": True,
-    "bypass_local": True,
-    "dns_mode": "server",
-    "log_level": "INFO"
+    "encryption_key": _REQUIRED,   # Must match server
+    "socks_listen": _REQUIRED,     # SOCKS5 proxy address
+    "server_url": _REQUIRED,       # Tunnel server URL
+    "outbound_http_proxy": "",     # Optional outbound proxy
+    "max_post_bytes": 5242880,     # 5MB default
+    "http_timeout": 30,            # HTTP request timeout
+    "heartbeat_interval": 1,       # Keep-alive interval (adaptive)
+    "batch_wait": 0.01,            # Data batching delay
+    "reconnect_delay": 0.5,        # Reconnection backoff base
+    "compression": True,           # Zlib compression enabled
+    "bypass_local": True,          # Bypass tunnel for localhost
+    "dns_mode": "server",          # DNS resolution: server or local
+    "log_level": "INFO"            # Logging verbosity
 }
 
 
 def clean_config(config: dict, config_type: str = "client") -> dict:
-    """Clean and validate configuration.
+    """Clean configuration by removing invalid params and adding defaults.
     
-    Removes invalid parameters, adds missing defaults, and validates required fields.
-    
-    Args:
-        config: Raw configuration dictionary.
-        config_type: 'server' or 'client'.
-        
-    Returns:
-        Cleaned configuration dictionary.
+    Required params (marked _REQUIRED) get None if missing.
+    Optional params get their default values if missing.
     """
     valid_params = SERVER_CONFIG_PARAMS if config_type == "server" else CLIENT_CONFIG_PARAMS
     cleaned = {}
@@ -56,33 +58,23 @@ def clean_config(config: dict, config_type: str = "client") -> dict:
         if param in config:
             cleaned[param] = config[param]
         elif default is _REQUIRED:
-            cleaned[param] = None
+            cleaned[param] = None  # Required but missing
         else:
-            cleaned[param] = default
+            cleaned[param] = default  # Use default
     
     return cleaned
 
 
 def save_config(config_path: str, config: dict) -> None:
-    """Save configuration to JSON file.
-    
-    Args:
-        config_path: Path to config file.
-        config: Configuration dictionary.
-    """
+    """Save configuration dictionary to JSON file."""
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
 
 def load_and_clean_config(config_path: str, config_type: str = "client") -> dict:
-    """Load config, clean it, save back if changed, return cleaned version.
+    """Load config file, clean it, save if changed, return cleaned version.
     
-    Args:
-        config_path: Path to config file.
-        config_type: 'server' or 'client'.
-        
-    Returns:
-        Cleaned configuration dictionary.
+    Prints changes made (removed/added parameters).
     """
     with open(config_path) as f:
         config = json.load(f)
@@ -106,14 +98,7 @@ def load_and_clean_config(config_path: str, config_type: str = "client") -> dict
 
 
 def generate_server_config(config_path: str = "server_config.json") -> bool:
-    """Interactive wizard to generate server configuration.
-    
-    Args:
-        config_path: Path to save config file.
-        
-    Returns:
-        True if config was saved, False if cancelled.
-    """
+    """Interactive wizard to generate server configuration file."""
     if os.path.exists(config_path):
         overwrite = input(f"Config {config_path} already exists. Overwrite? (y/N): ").lower()
         if overwrite != 'y':
@@ -123,6 +108,7 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     
     print("\n=== Server Configuration Wizard ===\n")
     
+    # Encryption key
     print("--- Encryption ---")
     print("Enter a pre-shared key (or press Enter for random generated):")
     psk = input("PSK Key: ").strip()
@@ -131,19 +117,22 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
         print(f"Generated random PSK: {psk}")
     config["encryption_key"] = psk
     
+    # Network settings
     print("\n--- Network ---")
     listen_addr = input("Listen address [0.0.0.0:8080]: ").strip()
     config["listen"] = listen_addr if listen_addr else "0.0.0.0:8080"
     
+    # Performance settings
     print("\n--- Performance (press Enter for defaults) ---")
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
-    _prompt_float(config, "tcp_timeout", "TCP session timeout in seconds", 60)
-    _prompt_float(config, "udp_timeout", "UDP session timeout in seconds", 120)
-    _prompt_float(config, "cleanup_interval", "Session cleanup interval in seconds", 30)
+    _prompt_float(config, "tcp_timeout", "TCP session timeout (seconds)", 60)
+    _prompt_float(config, "udp_timeout", "UDP session timeout (seconds)", 120)
+    _prompt_float(config, "cleanup_interval", "Cleanup interval (seconds)", 30)
     
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
+    # Logging
     print("\n--- Logging ---")
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
@@ -156,14 +145,7 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
 
 
 def generate_client_config(config_path: str = "client_config.json") -> bool:
-    """Interactive wizard to generate client configuration.
-    
-    Args:
-        config_path: Path to save config file.
-        
-    Returns:
-        True if config was saved, False if cancelled.
-    """
+    """Interactive wizard to generate client configuration file."""
     if os.path.exists(config_path):
         overwrite = input(f"Config {config_path} already exists. Overwrite? (y/N): ").lower()
         if overwrite != 'y':
@@ -173,6 +155,7 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     
     print("\n=== Client Configuration Wizard ===\n")
     
+    # Encryption key
     print("--- Encryption ---")
     print("Enter a pre-shared key (or press Enter for random generated):")
     psk = input("PSK Key: ").strip()
@@ -181,10 +164,12 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
         print(f"Generated random PSK: {psk}")
     config["encryption_key"] = psk
     
+    # SOCKS5 settings
     print("\n--- SOCKS5 Proxy ---")
     socks_addr = input("SOCKS5 listen address [127.0.0.1:1080]: ").strip()
     config["socks_listen"] = socks_addr if socks_addr else "127.0.0.1:1080"
     
+    # Server connection
     print("\n--- Server Connection ---")
     server_url = input("Server URL [http://localhost:8080/tunnel]: ").strip()
     config["server_url"] = server_url if server_url else "http://localhost:8080/tunnel"
@@ -192,24 +177,29 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     outbound_proxy = input("Outbound HTTP proxy (leave empty for none): ").strip()
     config["outbound_http_proxy"] = outbound_proxy if outbound_proxy else ""
     
+    # DNS mode (important for censorship bypass)
     print("\n--- DNS Configuration ---")
+    print("'server' mode prevents DNS leaks by resolving on server")
     dns_mode = input("DNS resolution mode (local/server) [server]: ").strip().lower()
     config["dns_mode"] = dns_mode if dns_mode in ["local", "server"] else "server"
     
+    # Performance
     print("\n--- Performance (press Enter for defaults) ---")
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
-    _prompt_float(config, "http_timeout", "HTTP request timeout in seconds", 30)
-    _prompt_float(config, "heartbeat_interval", "Heartbeat interval in seconds", 1)
-    _prompt_float(config, "batch_wait", "Batch wait time in seconds", 0.01)
-    _prompt_float(config, "reconnect_delay", "Reconnect delay in seconds", 0.5)
+    _prompt_float(config, "http_timeout", "HTTP request timeout (seconds)", 30)
+    _prompt_float(config, "heartbeat_interval", "Heartbeat interval (seconds)", 1)
+    _prompt_float(config, "batch_wait", "Batch wait time (seconds)", 0.01)
+    _prompt_float(config, "reconnect_delay", "Reconnect delay (seconds)", 0.5)
     
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
+    # Bypass
     print("\n--- Bypass ---")
     bypass_local = input("Bypass localhost requests? (Y/n) [Y]: ").strip().lower()
     config["bypass_local"] = bypass_local != 'n'
     
+    # Logging
     print("\n--- Logging ---")
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
