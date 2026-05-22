@@ -49,6 +49,32 @@ class SocksToHttpTunnel:
         self.http_timeout = self.config["http_timeout"]
         self.reconnect_delay = self.config["reconnect_delay"]
         
+        # Bypass configuration
+        self.bypass_ranges = self.config.get("bypass_ranges", [
+            "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+        ])
+        self.bypass_local = self.config.get("bypass_local", True)
+        self.bypass_private = self.config.get("bypass_private", True)
+        
+        # Pre-compile bypass networks for performance
+        import ipaddress
+        self.bypass_networks = []
+        for cidr in self.bypass_ranges:
+            try:
+                self.bypass_networks.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError as e:
+                self.logger.warning(f"Invalid bypass range '{cidr}': {e}")
+        
+        if self.bypass_private:
+            # Add all private network ranges if not already included
+            private_ranges = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+            for cidr in private_ranges:
+                net = ipaddress.ip_network(cidr, strict=False)
+                if net not in self.bypass_networks:
+                    self.bypass_networks.append(net)
+        
+        self.logger.info(f"Loaded {len(self.bypass_networks)} bypass networks")
+        
         socks_addr = self.config["socks_listen"].split(":")
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
@@ -85,94 +111,109 @@ class SocksToHttpTunnel:
         except Exception as e:
             self.logger.error(f"[{context}] HTTP error: {e}")
             raise
-    
-    def handle_socks_connection(self, local_conn: socket.socket, client_addr):
-        """Handle a SOCKS5 client connection."""
-        session_id = None
-        target_host = None
-        target_port = None
-        thread_id = threading.current_thread().name
-        client_str = f"{client_addr[0]}:{client_addr[1]}"
+
+    def _should_bypass(self, host):
+        """Check if host should bypass the tunnel."""
+        import ipaddress
         
+        # Always bypass localhost
+        if self.bypass_local and host in ["127.0.0.1", "localhost", "::1"]:
+            self.logger.debug(f"Bypassing localhost: {host}")
+            return True
+        
+        # Try to check if host is an IP address
         try:
-            self.logger.info(f"[{thread_id}] Connection from {client_str}")
+            ip = ipaddress.ip_address(host)
             
-            # Step 1: SOCKS5 greeting
-            local_conn.settimeout(10)
-            greeting = local_conn.recv(2)
-            if len(greeting) < 2:
-                self.logger.error(f"[{thread_id}] Incomplete greeting")
-                return
-            
-            ver, nmethods = greeting
-            
-            if ver != 5:
-                self.logger.error(f"[{thread_id}] Invalid SOCKS version: {ver}")
-                return
-            
-            methods = local_conn.recv(nmethods)
-            self.logger.debug(f"[{thread_id}] Auth methods: {list(methods)}")
-            
-            # Accept no authentication
-            local_conn.sendall(b"\x05\x00")
-            
-            # Step 2: SOCKS5 request
-            request = local_conn.recv(4)
-            if len(request) < 4:
-                self.logger.error(f"[{thread_id}] Incomplete request")
-                return
-            
-            ver, cmd, rsv, atyp = request
-            cmd_names = {1: "CONNECT", 2: "BIND", 3: "UDP ASSOCIATE"}
-            atyp_names = {1: "IPv4", 3: "DOMAIN", 4: "IPv6"}
-            self.logger.info(f"[{thread_id}] Request: {cmd_names.get(cmd, 'UNKNOWN')}")
-            
-            # Parse target address
-            if atyp == 1:  # IPv4
-                addr_bytes = local_conn.recv(4)
-                target_host = socket.inet_ntoa(addr_bytes)
-            elif atyp == 3:  # Domain name
-                length = local_conn.recv(1)[0]
-                target_host = local_conn.recv(length).decode()
-            elif atyp == 4:  # IPv6
-                addr_bytes = local_conn.recv(16)
-                target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
-                self.logger.warning(f"[{thread_id}] IPv6 may not work without IPv6 on server")
-            else:
-                self.logger.error(f"[{thread_id}] Unsupported address type: {atyp}")
-                local_conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-                return
-            
-            # Parse port
-            port_bytes = local_conn.recv(2)
-            target_port = int.from_bytes(port_bytes, 'big')
-            self.logger.info(f"[{thread_id}] Target: {target_host}:{target_port}")
-            
-            # Handle different SOCKS5 commands
-            if cmd == 1:  # CONNECT (TCP)
-                self._handle_tcp_connect(local_conn, client_addr, target_host, target_port, thread_id)
-            elif cmd == 3:  # UDP ASSOCIATE
-                self._handle_udp_associate(local_conn, client_addr, target_host, target_port, thread_id)
-            else:
-                self.logger.error(f"[{thread_id}] Unsupported command: {cmd}")
-                local_conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
-                
-        except socket.timeout:
-            self.logger.error(f"[{thread_id}] Handshake timeout")
-        except Exception as e:
-            self.logger.error(f"[{thread_id}] Error: {e}")
-        finally:
+            # Check against bypass networks
+            for network in self.bypass_networks:
+                if ip in network:
+                    self.logger.debug(f"Bypassing {host} (matches {network})")
+                    return True
+        except ValueError:
+            # Host is a domain name, try to resolve and check
             try:
-                local_conn.close()
-            except:
+                resolved_ips = socket.getaddrinfo(host, None)
+                for addr_info in resolved_ips:
+                    ip_str = addr_info[4][0]
+                    try:
+                        ip = ipaddress.ip_address(ip_str)
+                        for network in self.bypass_networks:
+                            if ip in network:
+                                self.logger.debug(f"Bypassing {host} ({ip_str} matches {network})")
+                                return True
+                    except ValueError:
+                        pass
+            except socket.gaierror:
                 pass
-            self.logger.info(f"[{thread_id}] Closed: {target_host}:{target_port}")
-    
+        
+        return False
+
+    def _handle_direct_connect(self, local_conn, client_addr, target_host, target_port, thread_id):
+        """Handle TCP connection directly without tunnel."""
+        direct_sock = None
+        try:
+            # Send success to SOCKS5 client first
+            response = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
+            local_conn.sendall(response)
+            
+            # Create direct connection
+            self.logger.info(f"[{thread_id}] Direct connect to {target_host}:{target_port}")
+            direct_sock = socket.create_connection((target_host, target_port), timeout=10)
+            direct_sock.setblocking(False)
+            
+            # Simple data relay between local and direct
+            local_conn.setblocking(False)
+            
+            while self.running:
+                # Check local -> direct
+                try:
+                    while True:
+                        chunk = local_conn.recv(8192)
+                        if not chunk:
+                            self.logger.info(f"[{thread_id}] Direct connection closed by client")
+                            return
+                        direct_sock.sendall(chunk)
+                except BlockingIOError:
+                    pass
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    return
+                
+                # Check direct -> local
+                try:
+                    while True:
+                        chunk = direct_sock.recv(8192)
+                        if not chunk:
+                            self.logger.info(f"[{thread_id}] Direct connection closed by remote")
+                            return
+                        local_conn.sendall(chunk)
+                except BlockingIOError:
+                    pass
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    return
+                
+                time.sleep(0.001)
+                
+        except Exception as e:
+            self.logger.error(f"[{thread_id}] Direct connection error: {e}")
+        finally:
+            if direct_sock:
+                try:
+                    direct_sock.close()
+                except:
+                    pass
+
     def _handle_tcp_connect(self, local_conn, client_addr, target_host, target_port, thread_id):
         """Handle TCP CONNECT through HTTP tunnel."""
         session_id = None
         
         try:
+            # Check if this connection should bypass the tunnel
+            if self._should_bypass(target_host):
+                self.logger.info(f"[{thread_id}] Direct connection to {target_host}:{target_port}")
+                self._handle_direct_connect(local_conn, client_addr, target_host, target_port, thread_id)
+                return
+            
             # Create tunnel session on server first
             self.logger.info(f"[{thread_id}] Creating tunnel to {target_host}:{target_port}")
             connect_msg = json.dumps({
@@ -292,7 +333,7 @@ class SocksToHttpTunnel:
                     self._http_post(enc_close, f"{thread_id}-final-close")
                 except:
                     pass
-    
+
     def _handle_udp_associate(self, local_conn, client_addr, target_host, target_port, thread_id):
         """Handle UDP ASSOCIATE command."""
         self.logger.info(f"[{thread_id}] UDP ASSOCIATE to {target_host}:{target_port}")
@@ -389,7 +430,89 @@ class SocksToHttpTunnel:
             
         except Exception as e:
             self.logger.error(f"[{thread_id}] UDP error: {e}")
-    
+
+    def handle_socks_connection(self, local_conn: socket.socket, client_addr):
+        """Handle a SOCKS5 client connection."""
+        session_id = None
+        target_host = None
+        target_port = None
+        thread_id = threading.current_thread().name
+        client_str = f"{client_addr[0]}:{client_addr[1]}"
+        
+        try:
+            self.logger.info(f"[{thread_id}] Connection from {client_str}")
+            
+            # Step 1: SOCKS5 greeting
+            local_conn.settimeout(10)
+            greeting = local_conn.recv(2)
+            if len(greeting) < 2:
+                self.logger.error(f"[{thread_id}] Incomplete greeting")
+                return
+            
+            ver, nmethods = greeting
+            
+            if ver != 5:
+                self.logger.error(f"[{thread_id}] Invalid SOCKS version: {ver}")
+                return
+            
+            methods = local_conn.recv(nmethods)
+            self.logger.debug(f"[{thread_id}] Auth methods: {list(methods)}")
+            
+            # Accept no authentication
+            local_conn.sendall(b"\x05\x00")
+            
+            # Step 2: SOCKS5 request
+            request = local_conn.recv(4)
+            if len(request) < 4:
+                self.logger.error(f"[{thread_id}] Incomplete request")
+                return
+            
+            ver, cmd, rsv, atyp = request
+            cmd_names = {1: "CONNECT", 2: "BIND", 3: "UDP ASSOCIATE"}
+            atyp_names = {1: "IPv4", 3: "DOMAIN", 4: "IPv6"}
+            self.logger.info(f"[{thread_id}] Request: {cmd_names.get(cmd, 'UNKNOWN')}")
+            
+            # Parse target address
+            if atyp == 1:  # IPv4
+                addr_bytes = local_conn.recv(4)
+                target_host = socket.inet_ntoa(addr_bytes)
+            elif atyp == 3:  # Domain name
+                length = local_conn.recv(1)[0]
+                target_host = local_conn.recv(length).decode()
+            elif atyp == 4:  # IPv6
+                addr_bytes = local_conn.recv(16)
+                target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+                self.logger.warning(f"[{thread_id}] IPv6 may not work without IPv6 on server")
+            else:
+                self.logger.error(f"[{thread_id}] Unsupported address type: {atyp}")
+                local_conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            
+            # Parse port
+            port_bytes = local_conn.recv(2)
+            target_port = int.from_bytes(port_bytes, 'big')
+            self.logger.info(f"[{thread_id}] Target: {target_host}:{target_port}")
+            
+            # Handle different SOCKS5 commands
+            if cmd == 1:  # CONNECT (TCP)
+                self._handle_tcp_connect(local_conn, client_addr, target_host, target_port, thread_id)
+            elif cmd == 3:  # UDP ASSOCIATE
+                self._handle_udp_associate(local_conn, client_addr, target_host, target_port, thread_id)
+            else:
+                self.logger.error(f"[{thread_id}] Unsupported command: {cmd}")
+                local_conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+                
+        except socket.timeout:
+            self.logger.error(f"[{thread_id}] Handshake timeout")
+        except Exception as e:
+            self.logger.error(f"[{thread_id}] Error: {e}")
+        finally:
+            try:
+                local_conn.close()
+            except:
+                pass
+            self.logger.info(f"[{thread_id}] Closed: {target_host}:{target_port}")
+
     def start(self):
         """Start SOCKS5 proxy server."""
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -402,6 +525,17 @@ class SocksToHttpTunnel:
         if self.proxies:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
         self.logger.info(f"HTTP timeout: {self.http_timeout}s, Heartbeat: {self.heartbeat_interval}s")
+        
+        # Log bypass configuration
+        if self.bypass_networks:
+            bypass_list = ", ".join([str(n) for n in self.bypass_networks[:5]])
+            if len(self.bypass_networks) > 5:
+                bypass_list += f" ... and {len(self.bypass_networks) - 5} more"
+            self.logger.info(f"Bypassing: {bypass_list}")
+        if self.bypass_local:
+            self.logger.info("Bypassing: localhost")
+        if self.bypass_private:
+            self.logger.info("Bypassing: private networks")
         
         try:
             while self.running:

@@ -137,6 +137,22 @@ def generate_client_config(config_path="client_config.json"):
     reconnect_delay = input("Reconnect delay in seconds [0.5]: ").strip()
     config["reconnect_delay"] = float(reconnect_delay) if reconnect_delay else 0.5
     
+    # Bypass configuration
+    print("\n--- Bypass Configuration ---")
+    print("Enter IP ranges to bypass tunnel (comma-separated, CIDR notation)")
+    print("Examples: 192.168.0.0/16,10.0.0.0/8,127.0.0.0/8")
+    bypass_input = input("Bypass ranges [127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16]: ").strip()
+    if bypass_input:
+        config["bypass_ranges"] = [r.strip() for r in bypass_input.split(",")]
+    else:
+        config["bypass_ranges"] = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    
+    bypass_local = input("Bypass localhost requests? (Y/n): ").strip().lower()
+    config["bypass_local"] = bypass_local != 'n'
+    
+    bypass_private = input("Bypass all private networks? (Y/n): ").strip().lower()
+    config["bypass_private"] = bypass_private != 'n'
+    
     # Logging
     print("\n--- Logging ---")
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
