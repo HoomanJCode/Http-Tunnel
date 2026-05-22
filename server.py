@@ -9,12 +9,12 @@ import struct
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from common import TunnelCrypto, generate_config_wizard, setup_logging, PROTO_TCP, PROTO_UDP
+from common import TunnelCrypto, generate_server_config, setup_logging, PROTO_TCP, PROTO_UDP
 
 class TunnelHandler(BaseHTTPRequestHandler):
     crypto = None
     max_post_bytes = 5242880
-    timeout = 60
+    tcp_timeout = 60
     udp_timeout = 120
     sessions = {}
     sessions_lock = threading.Lock()
@@ -299,7 +299,7 @@ class SessionCleaner(threading.Thread):
                     if s['proto'] == PROTO_UDP:
                         timeout = self.handler_class.udp_timeout
                     else:
-                        timeout = self.handler_class.timeout
+                        timeout = self.handler_class.tcp_timeout
                     
                     age = now - s['last_active']
                     if age > timeout:
@@ -316,29 +316,29 @@ class SessionCleaner(threading.Thread):
 def run_server(config_path="server_config.json"):
     if not os.path.exists(config_path):
         print(f"Config file {config_path} not found. Running setup wizard...")
-        if not generate_config_wizard(config_path, "server"):
+        if not generate_server_config(config_path):
             print("Setup cancelled.")
             return
     
     with open(config_path) as f:
         config = json.load(f)
     
-    # Set defaults for missing config options
-    config.setdefault("timeout", 60)
-    config.setdefault("udp_timeout", 120)
+    # Server-specific defaults
     config.setdefault("max_post_bytes", 5242880)
+    config.setdefault("tcp_timeout", 60)
+    config.setdefault("udp_timeout", 120)
     config.setdefault("cleanup_interval", 30)
     config.setdefault("log_level", "INFO")
     
     # Setup logging
     logger = setup_logging(config, "server")
-    logger.info("Loading configuration...")
+    logger.info("Loading server configuration...")
     logger.debug(f"Listen: {config['listen']}")
     
     TunnelHandler.logger = logger
     TunnelHandler.crypto = TunnelCrypto(config["encryption_key"])
     TunnelHandler.max_post_bytes = config["max_post_bytes"]
-    TunnelHandler.timeout = config["timeout"]
+    TunnelHandler.tcp_timeout = config["tcp_timeout"]
     TunnelHandler.udp_timeout = config["udp_timeout"]
     
     cleanup_interval = config.get("cleanup_interval", 30)
@@ -350,7 +350,7 @@ def run_server(config_path="server_config.json"):
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     logger.info(f"Listening on {host}:{port}")
-    logger.info(f"TCP timeout: {config['timeout']}s, UDP timeout: {config['udp_timeout']}s")
+    logger.info(f"TCP timeout: {config['tcp_timeout']}s, UDP timeout: {config['udp_timeout']}s")
     
     try:
         server.serve_forever()

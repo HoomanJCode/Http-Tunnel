@@ -7,29 +7,29 @@ import os
 import sys
 import logging
 import requests
-from common import TunnelCrypto, generate_config_wizard, setup_logging, PROTO_TCP, PROTO_UDP
+from common import TunnelCrypto, generate_client_config, setup_logging, PROTO_TCP, PROTO_UDP
 
 class SocksToHttpTunnel:
     def __init__(self, config_path="client_config.json"):
         if not os.path.exists(config_path):
             print(f"Config file {config_path} not found. Running setup wizard...")
-            if not generate_config_wizard(config_path, "client"):
+            if not generate_client_config(config_path):
                 raise RuntimeError("Setup cancelled.")
         
         with open(config_path) as f:
             self.config = json.load(f)
         
-        # Set defaults for missing config options
+        # Client-specific defaults
+        self.config.setdefault("max_post_bytes", 5242880)
         self.config.setdefault("http_timeout", 30)
         self.config.setdefault("heartbeat_interval", 1)
-        self.config.setdefault("max_post_bytes", 5242880)
         self.config.setdefault("batch_wait", 0.01)
         self.config.setdefault("reconnect_delay", 0.5)
         self.config.setdefault("log_level", "INFO")
         
         # Setup logging
         self.logger = setup_logging(self.config, "client")
-        self.logger.info("Loading configuration...")
+        self.logger.info("Loading client configuration...")
         self.logger.debug(f"Server URL: {self.config['server_url']}")
         self.logger.debug(f"Outbound proxy: {self.config.get('outbound_http_proxy', 'none')}")
         
@@ -401,7 +401,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"Server: {self.server_url}")
         if self.proxies:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"HTTP timeout: {self.http_timeout}s, Heartbeat: {self.heartbeat_interval}s, Batch: {self.batch_wait}s")
+        self.logger.info(f"HTTP timeout: {self.http_timeout}s, Heartbeat: {self.heartbeat_interval}s")
         
         try:
             while self.running:
