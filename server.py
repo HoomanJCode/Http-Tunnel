@@ -5,409 +5,468 @@ import time
 import select
 import os
 import sys
-import struct
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import ipaddress
+import requests
 from common import (
-    TunnelCrypto, generate_server_config, setup_logging, 
+    TunnelCrypto, generate_client_config, setup_logging, 
     compress_data, decompress_data, COMPRESS_ZLIB, 
     PROTO_TCP, PROTO_UDP, load_and_clean_config
 )
 
-class TunnelHandler(BaseHTTPRequestHandler):
-    crypto = None
-    max_post_bytes = 5242880
-    tcp_timeout = 60
-    udp_timeout = 120
-    sessions = {}
-    sessions_lock = threading.Lock()
-    executor = ThreadPoolExecutor(max_workers=50)
-    logger = None
-    compression = True
-    compress_method = COMPRESS_ZLIB
-    compress_threshold = 100
-    
-    # ... rest of TunnelHandler class unchanged from previous version ...
+class SocksToHttpTunnel:
+    def __init__(self, config_path="client_config.json"):
+        if not os.path.exists(config_path):
+            print(f"Config file {config_path} not found. Running setup wizard...")
+            if not generate_client_config(config_path):
+                raise RuntimeError("Setup cancelled.")
+        
+        self.config = load_and_clean_config(config_path, "client")
+        
+        self.logger = setup_logging(self.config, "client")
+        self.logger.info("Loading client configuration...")
+        
+        self.crypto = TunnelCrypto(self.config["encryption_key"])
+        self.server_url = self.config["server_url"]
+        self.proxies = {}
+        if self.config.get("outbound_http_proxy"):
+            self.proxies = {
+                "http": self.config["outbound_http_proxy"],
+                "https": self.config["outbound_http_proxy"]
+            }
+        
+        self.max_bytes = self.config["max_post_bytes"]
+        self.batch_wait = self.config["batch_wait"]
+        self.heartbeat_interval = self.config["heartbeat_interval"]
+        self.http_timeout = self.config["http_timeout"]
+        self.reconnect_delay = self.config["reconnect_delay"]
+        
+        socks_addr = self.config["socks_listen"].split(":")
+        self.socks_host = socks_addr[0]
+        self.socks_port = int(socks_addr[1])
+        
+        self.bypass_local = self.config["bypass_local"]
+        self.dns_mode = self.config["dns_mode"]
+        self.compression = self.config["compression"]
+        self.compress_method = COMPRESS_ZLIB
+        self.compress_threshold = 100
+        
+        self.min_heartbeat = self.heartbeat_interval
+        self.max_heartbeat = 30
+        self.current_heartbeat = self.min_heartbeat
+        
+        self.high_priority_ports = [22, 80, 443, 8080]
+        
+        self.running = True
+        self.logger.info("SOCKS5 tunnel client initialized")
 
-    def do_POST(self):
-        client = self.client_address[0]
+    def _http_post(self, body: str, context="unknown") -> str:
+        headers = {
+            "Content-Type": "text/plain",
+            "Connection": "keep-alive",
+            "Keep-Alive": "timeout=30, max=100"
+        }
+        proxies = self.proxies if self.proxies else None
+        
+        if not hasattr(self, '_session'):
+            self._session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=10,
+                pool_maxsize=20,
+                max_retries=1,
+                pool_block=False
+            )
+            self._session.mount('http://', adapter)
+            self._session.mount('https://', adapter)
+        
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            
-            if content_length > self.max_post_bytes:
-                self.logger.warning(f"[{client}] Payload too large: {content_length}")
-                self.send_error(413, "Payload too large")
-                return
-            
-            body = self.rfile.read(content_length).decode()
-            
-            try:
-                plain = self.crypto.decrypt(body)
-            except Exception as e:
-                self.logger.warning(f"[{client}] Decryption failed")
-                self.send_error(400, "Decryption failed")
-                return
-            
-            # Handle ping/health check
-            try:
-                msg = json.loads(plain.decode())
-                if isinstance(msg, dict) and msg.get("type") == "ping":
-                    self._send_encrypted(b"pong")
-                    return
-                elif isinstance(msg, dict) and msg.get("type") == "connect":
-                    self.logger.info(f"[{client}] CONNECT to {msg.get('host')}:{msg.get('port')}")
-                    self._handle_connect(msg)
-                    return
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-            
-            # Handle session-prefixed messages
-            if b'::' in plain:
-                parts = plain.split(b'::', 1)
-                session_id = parts[0].decode('ascii', errors='ignore')
-                message = parts[1] if len(parts) > 1 else b""
-                
-                if session_id in self.sessions:
-                    if message.startswith(b"UDP:"):
-                        self._handle_udp_data(client, session_id, message[4:])
-                    else:
-                        self._handle_tcp_data(client, session_id, message)
-                else:
-                    self.logger.warning(f"[{client}] Unknown session: {session_id}")
-                    self._send_encrypted(b"invalid_session")
-            else:
-                self._send_encrypted(b"invalid_format")
-                
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            start_time = time.time()
+            resp = self._session.post(
+                self.server_url,
+                data=body,
+                headers=headers,
+                proxies=proxies,
+                timeout=self.http_timeout
+            )
+            elapsed = (time.time() - start_time) * 1000
+            resp.raise_for_status()
+            if len(resp.text) > 200:
+                self.logger.debug(f"[{context}] Response: {len(resp.text)}B in {elapsed:.0f}ms")
+            return resp.text
         except Exception as e:
-            self.logger.error(f"[{client}] Error: {e}")
+            self.logger.error(f"[{context}] HTTP error: {e}")
+            if hasattr(self, '_session'):
+                try:
+                    self._session.close()
+                except:
+                    pass
+                del self._session
+            raise
+    
+    def _should_bypass(self, host):
+        if self.bypass_local and host in ["127.0.0.1", "localhost", "::1"]:
+            return True
+        return False
+    
+    def handle_socks_connection(self, local_conn: socket.socket, client_addr):
+        session_id = None
+        target_host = None
+        target_port = None
+        thread_id = threading.current_thread().name
+        
+        try:
+            local_conn.settimeout(10)
+            greeting = local_conn.recv(2)
+            if len(greeting) < 2:
+                return
+            
+            ver, nmethods = greeting
+            if ver != 5:
+                return
+            
+            methods = local_conn.recv(nmethods)
+            local_conn.sendall(b"\x05\x00")
+            
+            request = local_conn.recv(4)
+            if len(request) < 4:
+                return
+            
+            ver, cmd, rsv, atyp = request
+            
+            if atyp == 1:
+                addr_bytes = local_conn.recv(4)
+                target_host = socket.inet_ntoa(addr_bytes)
+            elif atyp == 3:
+                length = local_conn.recv(1)[0]
+                target_host = local_conn.recv(length).decode()
+            elif atyp == 4:
+                addr_bytes = local_conn.recv(16)
+                target_host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+            else:
+                local_conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            
+            port_bytes = local_conn.recv(2)
+            target_port = int.from_bytes(port_bytes, 'big')
+            
+            self.logger.info(f"[{thread_id}] {target_host}:{target_port}")
+            
+            if self._should_bypass(target_host):
+                self.logger.info(f"[{thread_id}] Direct (localhost bypass)")
+                self._handle_direct_connect(local_conn, target_host, target_port, thread_id)
+                return
+            
+            if cmd == 1:
+                self._handle_tcp_connect(local_conn, target_host, target_port, thread_id)
+            elif cmd == 3:
+                self._handle_udp_associate(local_conn, target_host, target_port, thread_id)
+                
+        except socket.timeout:
+            self.logger.error(f"[{thread_id}] Timeout")
+        except Exception as e:
+            self.logger.error(f"[{thread_id}] Error: {e}")
+        finally:
             try:
-                self.send_error(500)
+                local_conn.close()
             except:
                 pass
     
-    def _resolve_and_connect(self, host, port):
-        """Resolve hostname and connect. Handles both IP and domain names."""
+    def _handle_direct_connect(self, local_conn, target_host, target_port, thread_id):
+        direct_sock = None
         try:
-            socket.inet_pton(socket.AF_INET, host)
-            self.logger.info(f"Connecting to IPv4: {host}:{port}")
-            sock = socket.create_connection((host, port), timeout=10)
-            return sock
-        except socket.error:
-            pass
-        
-        try:
-            socket.inet_pton(socket.AF_INET6, host)
-            self.logger.info(f"Connecting to IPv6: {host}:{port}")
-            try:
-                sock = socket.create_connection((host, port), timeout=10)
-                return sock
-            except OSError as e:
-                self.logger.error(f"IPv6 failed: {e}")
-                raise
-        except socket.error:
-            pass
-        
-        self.logger.info(f"Resolving {host}:{port}...")
-        try:
-            addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-            addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+            response = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
+            local_conn.sendall(response)
             
-            for family, socktype, proto, canonname, sockaddr in addrs:
+            direct_sock = socket.create_connection((target_host, target_port), timeout=10)
+            direct_sock.setblocking(False)
+            local_conn.setblocking(False)
+            
+            while self.running:
                 try:
-                    self.logger.debug(f"Trying {sockaddr}")
-                    sock = socket.socket(family, socktype, proto)
-                    sock.settimeout(10)
-                    sock.connect(sockaddr)
-                    self.logger.info(f"Connected to {host} ({sockaddr[0]}:{sockaddr[1]})")
-                    return sock
-                except OSError as e:
-                    self.logger.debug(f"Failed: {e}")
-                    continue
-            
-            raise OSError(f"Could not connect to {host}:{port}")
-        except socket.gaierror as e:
-            raise OSError(f"DNS resolution failed for {host}: {e}")
-    
-    def _handle_connect(self, msg):
-        host = msg.get("host")
-        port = msg.get("port")
-        proto = msg.get("proto", PROTO_TCP)
-        
-        if not host or not port:
-            resp = json.dumps({"status": "error", "reason": "Missing host/port"})
-            self._send_encrypted(resp.encode())
-            return
-        
-        try:
-            session_id = self._generate_session_id()
-            
-            if proto == PROTO_UDP:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.setblocking(False)
-                self.logger.info(f"UDP session {session_id} for {host}:{port}")
-            else:
-                sock = self._resolve_and_connect(host, port)
-                sock.setblocking(False)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.logger.info(f"TCP session {session_id} for {host}:{port}")
-            
-            with self.sessions_lock:
-                self.sessions[session_id] = {
-                    'socket': sock,
-                    'last_active': time.time(),
-                    'host': host,
-                    'port': port,
-                    'proto': proto,
-                    'created': time.time(),
-                    'bytes_sent': 0,
-                    'bytes_received': 0,
-                    'requests': 0,
-                    'idle_count': 0
-                }
-            
-            resp = json.dumps({"status": "ok", "session": session_id, "proto": proto})
-            self._send_encrypted(resp.encode())
-            
-        except Exception as e:
-            self.logger.error(f"Connection failed to {host}:{port}: {e}")
-            resp = json.dumps({"status": "error", "reason": str(e)})
-            self._send_encrypted(resp.encode())
-    
-    def _handle_tcp_data(self, client, session_id, message):
-        with self.sessions_lock:
-            session = self.sessions.get(session_id)
-            if not session or session['proto'] != PROTO_TCP:
-                self._send_encrypted(b"invalid_session")
-                return
-            session['last_active'] = time.time()
-            session['idle_count'] = 0
-            session['requests'] += 1
-        
-        sock = session['socket']
-        
-        if message == b"CLOSE":
-            self.logger.info(f"[{client}] Session {session_id} closed by client")
-            self.logger.info(f"[{client}] Session stats: {session['requests']} req, {session['bytes_sent']}B sent, {session['bytes_received']}B recv")
-            self._close_session(session_id)
-            self._send_encrypted(b"closed")
-            return
-        
-        if message and message != b"HEARTBEAT" and message != b"CLOSE":
-            if self.compression:
-                try:
-                    message = decompress_data(message)
-                except Exception:
-                    pass
-        
-        if message and message != b"HEARTBEAT":
-            try:
-                total_sent = 0
-                while total_sent < len(message):
-                    try:
-                        sent = sock.send(message[total_sent:])
-                        if sent > 0:
-                            total_sent += sent
-                            session['bytes_sent'] += sent
-                        else:
-                            break
-                    except BlockingIOError:
-                        ready = select.select([], [sock], [], 0.1)
-                        if not ready[1]:
-                            break
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                self.logger.error(f"[{client}] Session {session_id}: Write error: {e}")
-                self._close_session(session_id)
-                self._send_encrypted(b"destination_closed")
-                return
-        
-        response_data = b""
-        try:
-            while True:
-                ready = select.select([sock], [], [], 0.01)
-                if ready[0]:
-                    try:
-                        chunk = sock.recv(65536)
+                    while True:
+                        chunk = local_conn.recv(8192)
                         if not chunk:
-                            self.logger.info(f"[{client}] Session {session_id}: Destination closed (EOF)")
-                            self._close_session(session_id)
-                            response_data = b"destination_closed"
-                            break
-                        response_data += chunk
-                        session['bytes_received'] += len(chunk)
-                        if len(response_data) >= self.max_post_bytes - 2000:
-                            break
-                    except BlockingIOError:
-                        break
-                    except (ConnectionResetError, BrokenPipeError) as e:
-                        self.logger.info(f"[{client}] Session {session_id}: Connection reset by destination")
-                        self._close_session(session_id)
-                        response_data = b"destination_closed"
-                        break
-                else:
-                    break
-        except Exception as e:
-            self.logger.error(f"[{client}] Session {session_id}: Read error: {e}")
-            self._close_session(session_id)
-            response_data = b"destination_closed"
-        
-        if response_data and response_data != b"destination_closed" and response_data != b"closed":
-            if self.compression:
-                try:
-                    response_data = compress_data(response_data, self.compress_method, self.compress_threshold)
-                except Exception:
+                            return
+                        direct_sock.sendall(chunk)
+                except BlockingIOError:
                     pass
-        
-        self._send_encrypted(response_data if response_data else b"")
-    
-    def _handle_udp_data(self, client, session_id, data):
-        with self.sessions_lock:
-            session = self.sessions.get(session_id)
-            if not session or session['proto'] != PROTO_UDP:
-                self._send_encrypted(b"invalid_session")
-                return
-            session['last_active'] = time.time()
-            session['idle_count'] = 0
-            session['requests'] += 1
-        
-        sock = session['socket']
-        
-        if data and data != b"CLOSE" and data != b"HEARTBEAT":
-            try:
-                addr = (session['host'], session['port'])
-                sock.sendto(data, addr)
-                session['bytes_sent'] += len(data)
-            except Exception as e:
-                self.logger.error(f"[{client}] Session {session_id}: UDP send error")
-        
-        response_data = b""
-        try:
-            ready = select.select([sock], [], [], 0.001)
-            if ready[0]:
-                data, addr = sock.recvfrom(65536)
-                response_data = data
-                session['bytes_received'] += len(data)
-        except (BlockingIOError, socket.error):
-            pass
-        
-        if response_data:
-            if self.compression:
+                except:
+                    return
+                
                 try:
-                    response_data = compress_data(response_data, self.compress_method, self.compress_threshold)
-                except Exception:
+                    while True:
+                        chunk = direct_sock.recv(8192)
+                        if not chunk:
+                            return
+                        local_conn.sendall(chunk)
+                except BlockingIOError:
                     pass
-        
-        self._send_encrypted(response_data if response_data else b"")
-    
-    def _send_encrypted(self, data_bytes):
-        try:
-            token = self.crypto.encrypt(data_bytes)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(token)))
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(token.encode())
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+                except:
+                    return
+                
+                time.sleep(0.001)
         except Exception as e:
-            self.logger.error(f"Send error: {e}")
-    
-    def _generate_session_id(self):
-        import uuid
-        return str(uuid.uuid4())[:8]
-    
-    def _close_session(self, session_id):
-        with self.sessions_lock:
-            if session_id in self.sessions:
+            self.logger.error(f"[{thread_id}] Direct error: {e}")
+        finally:
+            if direct_sock:
                 try:
-                    self.sessions[session_id]['socket'].close()
+                    direct_sock.close()
                 except:
                     pass
-                del self.sessions[session_id]
     
-    def log_message(self, format, *args):
-        if args and "200" not in str(args[0]):
-            self.logger.debug(f"[{self.client_address[0]}] {format % args}")
-
-class SessionCleaner(threading.Thread):
-    def __init__(self, handler_class, cleanup_interval=30):
-        super().__init__(daemon=True)
-        self.handler_class = handler_class
-        self.cleanup_interval = cleanup_interval
-        self.logger = logging.getLogger("server.cleaner")
-    
-    def run(self):
-        self.logger.info(f"Cleaner started ({self.cleanup_interval}s)")
-        while True:
-            time.sleep(self.cleanup_interval)
-            with self.handler_class.sessions_lock:
+    def _handle_tcp_connect(self, local_conn, target_host, target_port, thread_id):
+        session_id = None
+        
+        try:
+            connect_msg = json.dumps({
+                "type": "connect",
+                "host": target_host,
+                "port": target_port,
+                "proto": PROTO_TCP
+            })
+            
+            enc_connect = self.crypto.encrypt(connect_msg.encode())
+            resp = self._http_post(enc_connect, f"{thread_id}-connect")
+            resp_data = json.loads(self.crypto.decrypt(resp).decode())
+            
+            if resp_data.get("status") != "ok":
+                self.logger.error(f"[{thread_id}] Server refused: {resp_data.get('reason', 'Unknown')}")
+                local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            
+            session_id = resp_data["session"]
+            
+            response = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
+            local_conn.sendall(response)
+            self.logger.info(f"[{thread_id}] Tunnel: {session_id}")
+            
+            local_conn.setblocking(False)
+            buffer_out = b""
+            last_send = time.time()
+            total_sent = 0
+            total_received = 0
+            request_count = 0
+            
+            if target_port in self.high_priority_ports:
+                batch_wait = self.batch_wait * 0.5
+            else:
+                batch_wait = self.batch_wait
+            
+            while self.running and session_id:
                 now = time.time()
-                stale = []
-                for sid, s in self.handler_class.sessions.items():
-                    if s['proto'] == PROTO_UDP:
-                        timeout = self.handler_class.udp_timeout
-                    else:
-                        timeout = self.handler_class.tcp_timeout
-                    
-                    age = now - s['last_active']
-                    if age > timeout * 0.5:
-                        s['idle_count'] = s.get('idle_count', 0) + 1
-                    else:
-                        s['idle_count'] = 0
-                    
-                    if age > timeout and s.get('idle_count', 0) > 3:
-                        stale.append((sid, age, s['proto'], s.get('requests', 0)))
                 
-                for sid, age, proto, reqs in stale:
-                    self.logger.info(f"Clean {proto} session {sid} (idle {age:.0f}s, {reqs} req)")
+                try:
+                    while True:
+                        chunk = local_conn.recv(8192)
+                        if not chunk:
+                            self.logger.info(f"[{thread_id}] Local closed | {total_sent}B↑ {total_received}B↓")
+                            close_msg = session_id.encode() + b"::CLOSE"
+                            enc_close = self.crypto.encrypt(close_msg)
+                            try:
+                                self._http_post(enc_close, f"{thread_id}-close")
+                            except:
+                                pass
+                            return
+                        buffer_out += chunk
+                        if len(buffer_out) >= self.max_bytes - 2000:
+                            break
+                except BlockingIOError:
+                    pass
+                except:
+                    return
+                
+                should_send = False
+                if len(buffer_out) > 0:
+                    if len(buffer_out) >= self.max_bytes - 2000 or (now - last_send) >= batch_wait:
+                        should_send = True
+                elif (now - last_send) >= self.current_heartbeat:
+                    should_send = True
+                
+                if should_send:
+                    if len(buffer_out) > 0:
+                        payload = buffer_out[:self.max_bytes - 2000]
+                        buffer_out = buffer_out[self.max_bytes - 2000:]
+                        if self.compression and len(payload) > self.compress_threshold:
+                            try:
+                                payload = compress_data(payload, self.compress_method, self.compress_threshold)
+                            except:
+                                pass
+                        self.current_heartbeat = self.min_heartbeat
+                    else:
+                        payload = b"HEARTBEAT"
+                        self.current_heartbeat = min(self.current_heartbeat * 1.5, self.max_heartbeat)
+                    
+                    session_message = session_id.encode() + b"::" + payload
+                    enc_message = self.crypto.encrypt(session_message)
+                    
                     try:
-                        self.handler_class.sessions[sid]['socket'].close()
+                        request_count += 1
+                        resp_text = self._http_post(enc_message, f"{thread_id}-req{request_count}")
+                        plain_response = self.crypto.decrypt(resp_text)
+                        
+                        if plain_response == b"destination_closed":
+                            self.logger.info(f"[{thread_id}] Remote closed")
+                            return
+                        elif plain_response == b"invalid_session":
+                            self.logger.error(f"[{thread_id}] Session expired")
+                            return
+                        elif plain_response == b"closed":
+                            return
+                        elif plain_response and len(plain_response) > 0:
+                            if self.compression and len(plain_response) > 1:
+                                try:
+                                    decompressed = decompress_data(plain_response)
+                                    if decompressed:
+                                        plain_response = decompressed
+                                except:
+                                    pass
+                            
+                            total_received += len(plain_response)
+                            try:
+                                local_conn.sendall(plain_response)
+                            except:
+                                return
+                        
+                        total_sent += len(payload)
+                        last_send = now
+                        
+                    except Exception as e:
+                        self.logger.error(f"[{thread_id}] Req #{request_count}: {e}")
+                        time.sleep(self.reconnect_delay)
+                        continue
+                
+                time.sleep(0.001)
+                
+        except Exception as e:
+            self.logger.error(f"[{thread_id}] Tunnel error: {e}")
+        finally:
+            if session_id:
+                try:
+                    close_msg = session_id.encode() + b"::CLOSE"
+                    enc_close = self.crypto.encrypt(close_msg)
+                    self._http_post(enc_close, f"{thread_id}-final-close")
+                except:
+                    pass
+    
+    def _handle_udp_associate(self, local_conn, target_host, target_port, thread_id):
+        try:
+            connect_msg = json.dumps({
+                "type": "connect",
+                "host": target_host,
+                "port": target_port,
+                "proto": PROTO_UDP
+            })
+            
+            enc_connect = self.crypto.encrypt(connect_msg.encode())
+            resp = self._http_post(enc_connect, f"{thread_id}-udp-connect")
+            resp_data = json.loads(self.crypto.decrypt(resp).decode())
+            
+            if resp_data.get("status") != "ok":
+                local_conn.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                return
+            
+            udp_session_id = resp_data["session"]
+            
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.bind(('127.0.0.1', 0))
+            udp_port = udp_sock.getsockname()[1]
+            udp_sock.setblocking(False)
+            
+            response = b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1") + udp_port.to_bytes(2, 'big')
+            local_conn.sendall(response)
+            
+            last_activity = time.time()
+            
+            while self.running and udp_session_id:
+                now = time.time()
+                
+                try:
+                    ready = select.select([udp_sock], [], [], 0.05)
+                    if ready[0]:
+                        data, addr = udp_sock.recvfrom(65536)
+                        if data:
+                            udp_message = udp_session_id.encode() + b"::UDP:" + data
+                            enc_message = self.crypto.encrypt(udp_message)
+                            resp_text = self._http_post(enc_message, f"{thread_id}-udp")
+                            plain_response = self.crypto.decrypt(resp_text)
+                            
+                            if plain_response and plain_response != b"HEARTBEAT":
+                                udp_sock.sendto(plain_response, addr)
+                            
+                            last_activity = now
+                except BlockingIOError:
+                    pass
+                
+                if now - last_activity > self.heartbeat_interval:
+                    try:
+                        heartbeat_msg = udp_session_id.encode() + b"::UDP:HEARTBEAT"
+                        enc_heartbeat = self.crypto.encrypt(heartbeat_msg)
+                        self._http_post(enc_heartbeat, f"{thread_id}-udp-heartbeat")
+                        last_activity = now
                     except:
                         pass
-                    del self.handler_class.sessions[sid]
-
-def run_server(config_path="server_config.json"):
-    if not os.path.exists(config_path):
-        print(f"Config file {config_path} not found. Running setup wizard...")
-        if not generate_server_config(config_path):
-            print("Setup cancelled.")
-            return
+                
+                try:
+                    ready = select.select([local_conn], [], [], 0.001)
+                    if ready[0]:
+                        data = local_conn.recv(1)
+                        if not data:
+                            break
+                except:
+                    break
+            
+            udp_sock.close()
+        except Exception as e:
+            self.logger.error(f"[{thread_id}] UDP error: {e}")
     
-    # Load and clean config
-    config = load_and_clean_config(config_path, "server")
+    def _health_check(self):
+        try:
+            health_msg = json.dumps({"type": "ping"})
+            enc_health = self.crypto.encrypt(health_msg.encode())
+            self._http_post(enc_health, "health")
+            return True
+        except:
+            return False
     
-    # Setup logging
-    logger = setup_logging(config, "server")
-    logger.info("Loading server configuration...")
-    
-    TunnelHandler.logger = logger
-    TunnelHandler.crypto = TunnelCrypto(config["encryption_key"])
-    TunnelHandler.max_post_bytes = config["max_post_bytes"]
-    TunnelHandler.tcp_timeout = config["tcp_timeout"]
-    TunnelHandler.udp_timeout = config["udp_timeout"]
-    TunnelHandler.compression = config["compression"]
-    
-    cleanup_interval = config["cleanup_interval"]
-    cleaner = SessionCleaner(TunnelHandler, cleanup_interval)
-    cleaner.start()
-    
-    host, port = config["listen"].split(":")
-    server = HTTPServer((host, int(port)), TunnelHandler)
-    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    logger.info(f"Listening on {host}:{port}")
-    logger.info(f"TCP timeout: {config['tcp_timeout']}s, UDP timeout: {config['udp_timeout']}s")
-    logger.info(f"Compression: {'ON' if config['compression'] else 'OFF'}")
-    
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        server.shutdown()
+    def start(self):
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind((self.socks_host, self.socks_port))
+        server_sock.listen(50)
+        
+        self.logger.info(f"SOCKS5 on {self.socks_host}:{self.socks_port} → {self.server_url}")
+        self.logger.info(f"DNS: {self.dns_mode} | Compression: {'ON' if self.compression else 'OFF'}")
+        self.logger.info(f"Use: curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
+        
+        def health_checker():
+            while self.running:
+                time.sleep(15)
+                try:
+                    self._health_check()
+                except:
+                    pass
+        
+        threading.Thread(target=health_checker, daemon=True).start()
+        
+        try:
+            while self.running:
+                try:
+                    conn, addr = server_sock.accept()
+                    threading.Thread(
+                        target=self.handle_socks_connection,
+                        args=(conn, addr),
+                        daemon=True,
+                        name=f"T{addr[1]}"
+                    ).start()
+                except Exception as e:
+                    if self.running:
+                        self.logger.error(f"Accept: {e}")
+        except KeyboardInterrupt:
+            self.logger.info("Shutting down...")
+            self.running = False
+        finally:
+            server_sock.close()
 
 if __name__ == "__main__":
-    run_server()
+    tunnel = SocksToHttpTunnel()
+    tunnel.start()

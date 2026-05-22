@@ -116,8 +116,8 @@ class StreamManager:
 
 # Define valid parameters for each config type
 SERVER_CONFIG_PARAMS = {
-    "encryption_key": True,      # Required
-    "listen": True,              # Required
+    "encryption_key": True,
+    "listen": True,
     "max_post_bytes": 5242880,
     "tcp_timeout": 60,
     "udp_timeout": 120,
@@ -127,9 +127,9 @@ SERVER_CONFIG_PARAMS = {
 }
 
 CLIENT_CONFIG_PARAMS = {
-    "encryption_key": True,      # Required
-    "socks_listen": True,        # Required
-    "server_url": True,          # Required
+    "encryption_key": True,
+    "socks_listen": True,
+    "server_url": True,
     "outbound_http_proxy": "",
     "max_post_bytes": 5242880,
     "http_timeout": 30,
@@ -143,12 +143,7 @@ CLIENT_CONFIG_PARAMS = {
 }
 
 def clean_config(config, config_type="client"):
-    """Clean and validate configuration.
-    - Removes parameters not valid for this config type
-    - Sets defaults for missing parameters
-    - Saves cleaned config back to file
-    Returns cleaned config dict.
-    """
+    """Clean and validate configuration."""
     if config_type == "server":
         valid_params = SERVER_CONFIG_PARAMS
     else:
@@ -156,15 +151,12 @@ def clean_config(config, config_type="client"):
     
     cleaned = {}
     
-    # Copy only valid parameters with defaults
     for param, default in valid_params.items():
         if param in config:
             cleaned[param] = config[param]
         elif default is True:
-            # Required parameter missing
             cleaned[param] = None
         else:
-            # Optional parameter with default
             cleaned[param] = default
     
     return cleaned
@@ -240,7 +232,6 @@ def generate_server_config(config_path="server_config.json"):
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
     
-    # Clean config before saving
     config = clean_config(config, "server")
     save_config(config_path, config)
     
@@ -309,7 +300,6 @@ def generate_client_config(config_path="client_config.json"):
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
     config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
     
-    # Clean config before saving
     config = clean_config(config, "client")
     save_config(config_path, config)
     
