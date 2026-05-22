@@ -1,14 +1,14 @@
-## **README.md**
-
 # HTTP Tunnel - TCP/UDP over HTTP POST
 
 > **⚠️ EXPERIMENTAL - NOT FOR PRODUCTION USE ⚠️**
 
-A proof-of-concept tool that tunnels TCP and UDP traffic through HTTP POST requests, designed for highly restricted networks where only HTTP is allowed. Built through AI-human collaboration using DeepSeek AI.
+A proof-of-concept tool that tunnels TCP and UDP traffic through HTTP POST requests, designed for highly restricted networks where only HTTP is allowed. Built through AI-human collaboration using **DeepSeek AI**.
+
+---
 
 ## ⚠️ Disclaimers & Security Warnings
 
-### 🔴 **CRITICAL WARNINGS**
+### 🔴 CRITICAL WARNINGS
 
 1. **NOT PRODUCTION READY**: This is experimental software created for educational and research purposes only
 2. **SECURITY RISKS**: 
@@ -20,7 +20,7 @@ A proof-of-concept tool that tunnels TCP and UDP traffic through HTTP POST reque
 4. **NO WARRANTY**: This software comes with absolutely no warranty. See LICENSE file for details
 5. **PERFORMANCE LIMITATIONS**: HTTP/1.1 tunneling introduces significant latency and overhead. Not suitable for real-time applications
 
-### 📜 **Legal Notice**
+### 📜 Legal Notice
 
 Users are solely responsible for complying with all applicable laws and regulations. The authors assume no liability for misuse of this software.
 
@@ -70,6 +70,44 @@ HTTP Tunnel creates a virtual TCP/UDP connection through HTTP POST requests, all
 - **Health Checks**: Server health monitoring every 15 seconds
 - **Configuration Auto-Cleaning**: Invalid parameters removed, defaults added automatically
 - **Configurable Logging**: DEBUG/INFO/WARNING/ERROR levels
+- **Modular Architecture**: Clean package structure with separated concerns
+
+---
+
+## 📁 Project Structure
+
+```
+Http-Tunnel/
+├── http_tunnel/              # Main Python package
+│   ├── __init__.py
+│   ├── crypto.py             # Encryption utilities
+│   ├── compression.py        # Compression utilities
+│   ├── protocol.py           # Protocol constants & messages
+│   ├── config.py             # Configuration management
+│   ├── logging.py            # Logging setup
+│   ├── stream.py             # Stream multiplexing
+│   ├── server/               # Server-side implementation
+│   │   ├── __init__.py
+│   │   ├── handler.py        # HTTP request handler
+│   │   ├── session.py        # Session management
+│   │   ├── cleaner.py        # Session cleanup
+│   │   └── tunnel.py         # Server entry point
+│   └── client/               # Client-side implementation
+│       ├── __init__.py
+│       ├── socks.py          # SOCKS5 proxy server
+│       ├── tunnel.py         # Main client orchestrator
+│       ├── direct.py         # Direct connection handler
+│       └── udp.py            # UDP relay handler
+├── server.py                 # Server entry point (thin wrapper)
+├── client.py                 # Client entry point (thin wrapper)
+├── server_config.json        # Server configuration (auto-generated)
+├── client_config.json        # Client configuration (auto-generated)
+├── run.sh                    # Convenience launcher script
+├── setup.py                  # Package installation
+├── requirements.txt          # Python dependencies
+├── README.md                 # This file
+└── LICENSE                   # MIT License
+```
 
 ---
 
@@ -104,11 +142,11 @@ cd Http-Tunnel
 # Install dependencies
 pip install -r requirements.txt
 
-# Run setup wizard (asks only: PSK key, listen address, compression)
+# Run setup wizard (asks: PSK key, listen address)
 python server.py
 
-# Or with existing config
-python server.py
+# Or use the convenience script
+./run.sh server
 ```
 
 **Systemd Service (Linux)**:
@@ -154,10 +192,13 @@ python client.py
 #   Outbound proxy: (leave empty if none)
 #   DNS mode: server (recommended for censored networks)
 
+# Or use the convenience script
+./run.sh client
+
 # IMPORTANT: Use --socks5-hostname to prevent DNS leaks
 curl --socks5-hostname 127.0.0.1:1080 --ipv4 https://example.com
 
-# For SSH
+# For SSH tunneling
 ssh -o ProxyCommand='nc --proxy 127.0.0.1:1080 --proxy-type socks5 %h %p' user@remote-host
 ```
 
@@ -183,6 +224,8 @@ curl --socks5-hostname 127.0.0.1:1080 --ipv4 https://example.com
 ---
 
 ## ⚙️ Configuration
+
+Configuration files are automatically generated on first run. They are **auto-cleaned** on load: invalid parameters are removed and missing defaults are added.
 
 ### Server Configuration (`server_config.json`)
 ```json
@@ -217,38 +260,36 @@ curl --socks5-hostname 127.0.0.1:1080 --ipv4 https://example.com
 }
 ```
 
-> **Note**: Configuration files are automatically cleaned on load. Invalid parameters are removed and missing defaults are added. Each config file only contains parameters relevant to its role.
-
-### Server Configuration Parameters
+### Server Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `encryption_key` | (required) | Pre-shared key for encrypting tunnel traffic |
+| `encryption_key` | *(required)* | Pre-shared key for encrypting tunnel traffic |
 | `listen` | `0.0.0.0:8080` | Server listen address and port |
 | `max_post_bytes` | `5242880` | Maximum POST request size (5MB) |
 | `tcp_timeout` | `60` | TCP session timeout in seconds |
 | `udp_timeout` | `120` | UDP session timeout in seconds |
 | `cleanup_interval` | `30` | Session cleanup check interval |
 | `compression` | `true` | Enable/disable zlib compression |
-| `log_level` | `INFO` | Logging level (DEBUG/INFO/WARNING/ERROR) |
+| `log_level` | `INFO` | Logging level |
 
-### Client Configuration Parameters
+### Client Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `encryption_key` | (required) | Pre-shared key (must match server) |
+| `encryption_key` | *(required)* | Pre-shared key (must match server) |
 | `socks_listen` | `127.0.0.1:1080` | Local SOCKS5 proxy address |
 | `server_url` | `http://localhost:8080/tunnel` | Tunnel server URL |
 | `outbound_http_proxy` | `""` | Optional HTTP proxy for outbound |
-| `dns_mode` | `server` | DNS resolution: `server` (no leaks) or `local` |
-| `max_post_bytes` | `5242880` | Maximum POST request size (5MB) |
+| `dns_mode` | `server` | DNS: `server` (no leaks) or `local` |
+| `max_post_bytes` | `5242880` | Maximum POST request size |
 | `http_timeout` | `30` | HTTP request timeout in seconds |
-| `heartbeat_interval` | `1` | Keepalive heartbeat interval (adaptive 1s-30s) |
-| `batch_wait` | `0.01` | Data batching delay for efficiency |
-| `reconnect_delay` | `0.5` | Delay between reconnection attempts |
+| `heartbeat_interval` | `1` | Keepalive interval (adaptive 1s-30s) |
+| `batch_wait` | `0.01` | Data batching delay |
+| `reconnect_delay` | `0.5` | Reconnection delay |
 | `compression` | `true` | Enable/disable zlib compression |
-| `bypass_local` | `true` | Bypass tunnel for localhost connections |
-| `log_level` | `INFO` | Logging level (DEBUG/INFO/WARNING/ERROR) |
+| `bypass_local` | `true` | Bypass tunnel for localhost |
+| `log_level` | `INFO` | Logging level |
 
 ---
 
@@ -272,112 +313,128 @@ curl --socks5-hostname 127.0.0.1:1080 --ipv4 https://example.com
 ## 🛠️ Troubleshooting
 
 ### Connection Refused (curl error 97)
-- Use `--socks5-hostname` instead of `--socks5` to send domain names to proxy
+- Use `--socks5-hostname` instead of `--socks5`
 - Add `--ipv4` flag to avoid IPv6 issues
-- Verify server is running and port is open
+- Verify server is running: `curl http://server:8080/tunnel`
 
 ### DNS Leaks / Censored DNS
 - Set `dns_mode: server` in client config
-- Always use `curl --socks5-hostname`
+- Always use `curl --socks5-hostname` (NOT `--socks5`)
 - Check client log shows "DNS: server"
 
 ### Timeouts
-- Increase `http_timeout` for slow connections (default 30s)
+- Increase `http_timeout` (default 30s)
 - Check outbound proxy settings
 - Verify network allows HTTP POST to your server
 
 ### IPv6 Issues
 - Use `--ipv4` flag with curl
-- Server must have IPv6 connectivity if connecting to IPv6 destinations
+- Server must have IPv6 connectivity for IPv6 destinations
 
 ### Slow Performance
-- Enable compression (`compression: true`)
+- Enable compression: `compression: true`
 - Increase `max_post_bytes` for larger chunks
 - Decrease `batch_wait` for lower latency
-- Decrease `heartbeat_interval` for more responsive connections
 
-### Server Crashes
-- Update to latest version with ConnectionResetError handling
-- Check server logs for error details
+### Server Crashes (ConnectionResetError)
+- Fixed in latest version - update if using older code
 - Restart with systemd service for auto-recovery
+
+### Module Import Errors
+- Ensure you're running from project root directory
+- Check that `http_tunnel/` package directory exists
+- Verify `__init__.py` files exist in all subdirectories
+
+---
+
+## 🏗️ Architecture
+
+### Design Principles
+- **Separation of Concerns**: Each module has a single responsibility
+- **Dependency Injection**: Components receive their dependencies
+- **Configuration over Code**: Behavior controlled by JSON config
+- **Fail Fast**: Validate configuration on startup
+- **Graceful Degradation**: Handle errors without crashing
+
+### Key Components
+
+| Module | Responsibility |
+|--------|---------------|
+| `crypto.py` | Fernet symmetric encryption |
+| `compression.py` | Zlib compression with marker bytes |
+| `protocol.py` | Message formatting and parsing |
+| `config.py` | Config validation, cleaning, generation |
+| `server/handler.py` | HTTP POST request processing |
+| `server/session.py` | Session lifecycle management |
+| `server/cleaner.py` | Stale session cleanup |
+| `client/socks.py` | SOCKS5 proxy server |
+| `client/tunnel.py` | Main client orchestrator |
+| `client/direct.py` | Direct connection for bypassed hosts |
+| `client/udp.py` | UDP relay through HTTP |
 
 ---
 
 ## 🤝 Contributing
 
-### This is a "Vibe Coding" Project
+### Vibe Coding with DeepSeek AI
 
-This project was created through "vibe coding" - an experimental development approach using **DeepSeek AI** to generate code based on natural language descriptions and iterative refinement. The entire codebase was written through AI-human collaboration over multiple sessions.
+This project was created through **"vibe coding"** - an experimental development approach using **DeepSeek AI** to generate code based on natural language descriptions and iterative refinement. The entire codebase was written through AI-human collaboration.
 
 ### How to Contribute
 
 1. **Fork the repository**
-2. **Create a feature branch**:
-   ```bash
-   git checkout -b feature/amazing-feature
-   ```
+2. **Create a feature branch**: `git checkout -b feature/amazing-feature`
 3. **Make your changes**
 4. **Test thoroughly** in your environment
-5. **Submit a Pull Request** with:
-   - Description of changes
-   - Test cases
-   - Any configuration changes needed
+5. **Submit a Pull Request** with description and test cases
 
 ### Development Guidelines
 
 - Keep dependencies minimal (`cryptography`, `requests`)
-- Configuration auto-cleaning on load (remove invalid, add defaults)
-- Log all errors with appropriate levels
-- Don't log sensitive data (keys, credentials)
+- Follow existing module structure
+- Log errors with appropriate levels
+- Never log sensitive data (keys, credentials)
 - Test with both direct and proxy connections
-- Verify TCP and UDP functionality
 - Test with `--socks5-hostname` for DNS leak prevention
 
 ### Areas for Improvement
 
 - [ ] HTTPS/TLS support with certificate verification
-- [ ] WebSocket support for better performance
+- [ ] WebSocket transport support
 - [ ] HTTP/2 multiplexing
-- [ ] Authentication beyond PSK
+- [ ] Stronger authentication (JWT, client certificates)
 - [ ] Bandwidth throttling
-- [ ] Connection pooling optimization
-- [ ] Better IPv6 support
-- [ ] GUI configuration tool
 - [ ] Docker containers
 - [ ] Performance benchmarks
+- [ ] GUI configuration tool
+- [ ] SOCKS5 username/password authentication
 
 ---
 
 ## 📊 Limitations
 
-- **High Latency**: 50-500ms added per request due to HTTP overhead
-- **No Stream Multiplexing**: Each TCP connection requires its own HTTP request loop
+- **High Latency**: 50-500ms per request due to HTTP overhead
+- **No Stream Multiplexing**: Each TCP connection = separate HTTP loop
 - **HTTP/1.1 Only**: No WebSocket or HTTP/2 support
 - **Basic Encryption**: Not suitable for highly sensitive data
-- **Sequential Delivery**: Packets may be reordered under high load
+- **Sequential Delivery**: Packets may reorder under high load
 
 ---
 
 ## 📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
 ## 🙏 Acknowledgments
 
 - **DeepSeek AI** - Code generation and development assistance
-- The Python community for excellent libraries
-- Security researchers who document tunneling techniques
-- Everyone who tests and reports bugs
+- Python community for `cryptography` and `requests` libraries
+- Security researchers documenting tunneling techniques
+- All contributors and bug reporters
 
 ---
 
-## ⭐ Star History
-
-If you find this project interesting or useful, please consider giving it a star ⭐
-
----
-
-> **Remember**: This tool is for educational and authorized testing purposes only. The authors are not responsible for any misuse or damages. Always respect network policies and obtain proper authorization before testing.
+> **Remember**: This tool is for educational and authorized testing purposes only. Always respect network policies and obtain proper authorization before testing.
 ```
