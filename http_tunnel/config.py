@@ -31,6 +31,8 @@ CLIENT_CONFIG_PARAMS = {
     "max_post_bytes": 5242880,
     "bypass_local": True,
     "bypass_ranges": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+    "route_http": "tunnel",      # direct | proxy | tunnel
+    "route_https": "tunnel",     # direct | proxy | tunnel
     "high_priority_ports": [22, 80, 443, 8080],
     "log_level": "INFO"
 }
@@ -119,6 +121,14 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     config["outbound_http_proxy"] = input("Outbound proxy (empty=none): ").strip()
     print("\nDNS (server=no leaks):")
     config["dns_mode"] = input("DNS mode (local/server) [server]: ").strip().lower() or "server"
+    print("\nRouting (direct | proxy | tunnel):")
+    print("  direct = connect directly to internet")
+    print("  proxy  = route through outbound proxy")
+    print("  tunnel = route through HTTP tunnel")
+    route_http = input("HTTP (port 80) routing [tunnel]: ").strip().lower()
+    config["route_http"] = route_http if route_http in ("direct", "proxy", "tunnel") else "tunnel"
+    route_https = input("HTTPS (port 443) routing [tunnel]: ").strip().lower()
+    config["route_https"] = route_https if route_https in ("direct", "proxy", "tunnel") else "tunnel"
     print("\nTimeouts (Enter for defaults):")
     _prompt_float(config, "connect_timeout", "TCP connect timeout (s)", 8)
     _prompt_float(config, "http_timeout", "HTTP timeout (s)", 45)
