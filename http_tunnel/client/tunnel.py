@@ -1,9 +1,4 @@
-"""HTTP tunnel client - main orchestrator.
-
-Bridges local SOCKS5 proxy to remote HTTP tunnel server.
-Simple, clean approach: one tunnel per SOCKS5 connection.
-No connection pooling, no artificial limits.
-"""
+"""HTTP tunnel client - main orchestrator. Simple, one tunnel per connection."""
 
 import socket
 import time
@@ -31,66 +26,37 @@ from http_tunnel.client.udp import UdpRelay
 
 
 class SocksToHttpTunnel:
-    """Main client that bridges SOCKS5 to HTTP tunnel.
-    
-    Simple design: one HTTP tunnel per SOCKS5 connection.
-    No multiplexing, no connection limits - just works.
-    """
+    """Main client that bridges SOCKS5 to HTTP tunnel."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
             raise RuntimeError("Setup cancelled.")
-        
         self.logger = setup_logging(self.config, "client")
         self.logger.info("Loading client configuration...")
-        
-        # Core
         self.crypto = TunnelCrypto(self.config["encryption_key"])
         self.server_url = self.config["server_url"]
         self.running = True
-        
-        # Proxy
         self.proxies = {}
         if self.config.get("outbound_http_proxy"):
-            proxy = self.config["outbound_http_proxy"]
-            self.proxies = {"http": proxy, "https": proxy}
-        
-        # Timing
+            self.proxies = {"http": self.config["outbound_http_proxy"], "https": self.config["outbound_http_proxy"]}
         self.http_timeout = self.config["http_timeout"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
         self.batch_wait = self.config["batch_wait"]
         self.reconnect_delay = self.config["reconnect_delay"]
-        
-        # Size
         self.max_bytes = self.config["max_post_bytes"]
-        
-        # Compression
         self.compression = self.config["compression"]
         self.compress_threshold = self.config.get("compress_threshold", 100)
         self.skip_compress_tls = self.config.get("skip_compress_tls", True)
-        
-        # Bypass
         self.bypass_local = self.config["bypass_local"]
         self._setup_bypass_networks()
-        
-        # QoS
         self.high_priority_ports = self.config.get("high_priority_ports", [22, 80, 443, 8080])
-        
-        # SOCKS5
         socks_addr = self.config["socks_listen"].split(":")
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
-        
-        # DNS
         self.dns_mode = self.config["dns_mode"]
-        
-        # HTTP session with large connection pool
         self._setup_http_session()
-        
-        # Components
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        
         self.logger.info("SOCKS5 tunnel client initialized")
     
     def _load_config(self, config_path: str) -> bool:
@@ -110,38 +76,22 @@ class SocksToHttpTunnel:
                 pass
     
     def _setup_http_session(self):
-        """Create HTTP session with large connection pool for browser traffic."""
         self._session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=50,
-            pool_maxsize=100,
-            max_retries=0,
-            pool_block=False
-        )
+        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=100, max_retries=0, pool_block=False)
         self._session.mount('http://', adapter)
         self._session.mount('https://', adapter)
     
     def http_post(self, body: str, context: str = "unknown") -> str:
-        """Send POST request to tunnel server."""
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
-        
         for attempt in range(3):
             try:
-                resp = self._session.post(
-                    self.server_url,
-                    data=body,
-                    headers=headers,
-                    proxies=self.proxies if self.proxies else None,
-                    timeout=self.http_timeout
-                )
-                
+                resp = self._session.post(self.server_url, data=body, headers=headers,
+                                         proxies=self.proxies if self.proxies else None, timeout=self.http_timeout)
                 if resp.status_code == 502 and attempt < 2:
                     time.sleep(self.reconnect_delay * (attempt + 1))
                     continue
-                
                 resp.raise_for_status()
                 return resp.text
-                
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
                 if attempt < 2:
                     time.sleep(self.reconnect_delay * (attempt + 1))
@@ -151,7 +101,6 @@ class SocksToHttpTunnel:
                 raise
     
     def should_bypass(self, host: str) -> bool:
-        """Check if host should bypass tunnel."""
         if self.bypass_local and host in ["127.0.0.1", "localhost", "::1"]:
             return True
         try:
@@ -163,56 +112,37 @@ class SocksToHttpTunnel:
             pass
         return False
     
-    def handle_connection(self, conn: socket.socket, target_host: str, 
-                         target_port: int, cmd: int, atyp: int):
-        """Route SOCKS5 connection to appropriate handler."""
+    def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
-        
-        if cmd == 1:  # TCP CONNECT
-            if self.should_bypass(target_host):
-                self.direct.handle(conn, target_host, target_port, thread_id)
-            else:
-                self._handle_tcp_connect(conn, target_host, target_port, thread_id)
-        elif cmd == 3:  # UDP ASSOCIATE
-            # For UDP ASSOCIATE, the address/port is the client's address
-            # We need to create a local UDP relay
+        if cmd == 1 and self.should_bypass(target_host):
+            self.direct.handle(conn, target_host, target_port, thread_id)
+        elif cmd == 1:
+            self._handle_tcp_connect(conn, target_host, target_port, thread_id)
+        elif cmd == 3:
             self.udp.handle(conn, target_host, target_port, thread_id)
     
-    def _handle_tcp_connect(self, local_conn: socket.socket, target_host: str,
-                           target_port: int, thread_id: str):
-        """Handle TCP CONNECT - one tunnel per connection."""
+    def _handle_tcp_connect(self, local_conn: socket.socket, target_host: str, target_port: int, thread_id: str):
         session_id = None
-        
         try:
-            # Create tunnel
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
             enc_connect = self.crypto.encrypt(connect_msg.encode())
             resp = self.http_post(enc_connect, f"{thread_id}-connect")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
-            
             if resp_data.get("status") != "ok":
                 self.logger.error(f"[{thread_id}] Server refused: {resp_data.get('reason')}")
                 local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
-            
             session_id = resp_data["session"]
-            
-            # SOCKS5 success
             response = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
             local_conn.sendall(response)
             self.logger.info(f"[{thread_id}] Tunnel: {session_id} → {target_host}:{target_port}")
-            
-            # Data relay
             local_conn.setblocking(False)
             buffer_out = b""
             last_send = time.time()
             current_heartbeat = self.heartbeat_interval
             batch_wait = self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0
-            
             while self.running and session_id:
                 now = time.time()
-                
-                # Read from local app
                 try:
                     while True:
                         chunk = local_conn.recv(8192)
@@ -227,21 +157,16 @@ class SocksToHttpTunnel:
                     pass
                 except:
                     return
-                
-                # Send decision
                 should_send = False
                 if len(buffer_out) > 0:
                     if batch_wait == 0 or len(buffer_out) >= self.max_bytes - 2000 or (now - last_send) >= batch_wait:
                         should_send = True
                 elif (now - last_send) >= current_heartbeat:
                     should_send = True
-                
                 if should_send:
                     if len(buffer_out) > 0:
                         payload = buffer_out[:self.max_bytes - 2000]
                         buffer_out = buffer_out[self.max_bytes - 2000:]
-                        
-                        # Compress if beneficial
                         if self.compression and len(payload) > self.compress_threshold:
                             if not self.skip_compress_tls or not is_tls_data(payload):
                                 try:
@@ -252,14 +177,11 @@ class SocksToHttpTunnel:
                     else:
                         payload = MSG_HEARTBEAT
                         current_heartbeat = min(current_heartbeat * 1.5, 30)
-                    
                     session_message = create_session_message(session_id, payload)
                     enc_message = self.crypto.encrypt(session_message)
-                    
                     try:
                         resp_text = self.http_post(enc_message, f"{thread_id}")
                         plain_response = self.crypto.decrypt(resp_text)
-                        
                         if plain_response == b"destination_closed":
                             self.logger.info(f"[{thread_id}] Remote closed")
                             return
@@ -269,7 +191,6 @@ class SocksToHttpTunnel:
                         elif plain_response == b"closed":
                             return
                         elif plain_response and len(plain_response) > 0:
-                            # Decompress
                             if self.compression and len(plain_response) > 1:
                                 try:
                                     decompressed = decompress_data(plain_response)
@@ -277,21 +198,16 @@ class SocksToHttpTunnel:
                                         plain_response = decompressed
                                 except:
                                     pass
-                            
                             try:
                                 local_conn.sendall(plain_response)
                             except:
                                 return
-                        
                         last_send = now
-                        
                     except Exception as e:
                         self.logger.error(f"[{thread_id}] Error: {e}")
                         time.sleep(self.reconnect_delay)
                         continue
-                
                 time.sleep(0.001)
-                
         except Exception as e:
             self.logger.error(f"[{thread_id}] Tunnel error: {e}")
         finally:
@@ -299,7 +215,6 @@ class SocksToHttpTunnel:
                 self._send_close(session_id)
     
     def _send_close(self, session_id: str):
-        """Send close message."""
         try:
             close_msg = create_session_message(session_id, MSG_CLOSE)
             enc_close = self.crypto.encrypt(close_msg)
@@ -308,15 +223,11 @@ class SocksToHttpTunnel:
             pass
     
     def start(self):
-        """Start the tunnel client."""
         self.logger.info(f"SOCKS5 on {self.socks_host}:{self.socks_port} → {self.server_url}")
         self.logger.info(f"DNS: {self.dns_mode} | Compression: {'ON' if self.compression else 'OFF'}")
         self.logger.info(f"Use: curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
-        
-        # SOCKS5 server (unlimited connections)
         socks_server = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         socks_server.start()
-        
         try:
             while self.running:
                 time.sleep(1)
