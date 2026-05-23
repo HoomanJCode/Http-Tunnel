@@ -4,6 +4,7 @@ Message formats:
 - Connect: {"type": "connect", "host": "...", "port": 443, "proto": 1}
 - Ping: {"type": "ping"}
 - Session data: session_id::payload
+- Stream data: session_id::stream_id::payload  (NEW - for multiplexed streams)
 - UDP data: session_id::UDP:payload
 - Close: session_id::CLOSE
 - Heartbeat: session_id::HEARTBEAT
@@ -43,21 +44,41 @@ def create_session_message(session_id: str, data: bytes) -> bytes:
     return session_id.encode() + b"::" + data
 
 
+def create_stream_message(session_id: str, stream_id: str, data: bytes) -> bytes:
+    """Create a stream data message: session_id::stream_id::data
+    
+    Used when multiple SOCKS5 connections share one tunnel session.
+    The stream_id routes data to the correct SOCKS5 connection.
+    """
+    return session_id.encode() + b"::" + stream_id.encode() + b"::" + data
+
+
 def create_udp_message(session_id: str, data: bytes) -> bytes:
     """Create a UDP data message: session_id::UDP:data"""
     return session_id.encode() + b"::UDP:" + data
 
 
 def parse_session_message(message: bytes) -> tuple:
-    """Parse session message into (session_id, data). Returns (None, None) if invalid."""
+    """Parse session message into (session_id, data).
+    
+    Also handles stream messages: (session_id, stream_id::data)
+    Returns (None, None) if invalid.
+    """
     if b'::' not in message:
-        return None, None
+        return None, None, None
     
-    parts = message.split(b'::', 1)
+    parts = message.split(b'::', 2)  # Max 3 parts
     session_id = parts[0].decode('ascii', errors='ignore')
-    data = parts[1] if len(parts) > 1 else b""
     
-    return session_id, data
+    if len(parts) == 2:
+        # Old format: session_id::data
+        return session_id, None, parts[1]
+    elif len(parts) == 3:
+        # New format: session_id::stream_id::data
+        stream_id = parts[1].decode('ascii', errors='ignore')
+        return session_id, stream_id, parts[2]
+    
+    return None, None, None
 
 
 def is_tls_data(data: bytes) -> bool:

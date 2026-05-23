@@ -1,16 +1,8 @@
 """HTTP request handler for tunnel server.
 
 Processes incoming POST requests containing tunnel data.
-Handles three message types:
-1. Control messages (ping, connect)
-2. TCP session data (forward to destination, read response)
-3. UDP session data (forward to destination, read response)
-
-Key optimizations:
-- Non-blocking I/O with select for responsive data relay
-- TCP_NODELAY for low latency
-- Smart compression: skip for TLS/encrypted data
-- Connection reuse via HTTP keep-alive
+Supports multiplexed streams where multiple SOCKS5 connections
+share a single tunnel session using stream IDs.
 """
 
 import json
@@ -30,7 +22,11 @@ from http_tunnel.server.session import Session, SessionManager
 
 
 class TunnelRequestHandler(BaseHTTPRequestHandler):
-    """Handles HTTP POST requests for tunnel data relay."""
+    """Handles HTTP POST requests for tunnel data relay.
+    
+    Supports both simple sessions (one stream) and multiplexed
+    sessions (multiple streams sharing one tunnel connection).
+    """
     
     # Class-level configuration (set by server entry point)
     crypto: TunnelCrypto = None
@@ -49,7 +45,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         try:
             super().handle_one_request()
         except (ConnectionResetError, BrokenPipeError, OSError):
-            pass  # Client disconnected - normal
+            pass
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error handling request: {e}")
@@ -60,13 +56,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             
-            # Size check
             if content_length > self.max_post_bytes:
                 self.logger.warning(f"[{client}] Payload too large: {content_length}")
                 self.send_error(413, "Payload too large")
                 return
             
-            # Read and decrypt body
             try:
                 body = self.rfile.read(content_length).decode()
             except (ConnectionResetError, BrokenPipeError, OSError):
@@ -96,15 +90,15 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
             
-            # Handle session data messages
-            session_id, message = parse_session_message(plain)
+            # Handle session data messages (with optional stream_id)
+            session_id, stream_id, message = parse_session_message(plain)
             if session_id:
                 session = self.sessions.get(session_id)
                 if session:
                     if message.startswith(b"UDP:"):
                         self._handle_udp_data(client, session, message[4:])
                     else:
-                        self._handle_tcp_data(client, session, message)
+                        self._handle_tcp_data(client, session, message, stream_id)
                 else:
                     self.logger.warning(f"[{client}] Unknown session: {session_id}")
                     self._send_encrypted(b"invalid_session")
@@ -123,12 +117,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     # ─── Connection Handling ─────────────────────────────────────────
     
     def _handle_connect(self, msg: dict) -> None:
-        """Handle new connection request.
-        
-        Creates a session with connection to the target host.
-        TCP connections get TCP_NODELAY for lower latency.
-        UDP connections are stateless.
-        """
+        """Handle new connection request."""
         host = msg.get("host")
         port = msg.get("port")
         proto = msg.get("proto", PROTO_TCP)
@@ -164,11 +153,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             }).encode())
     
     def _resolve_and_connect(self, host: str, port: int) -> socket.socket:
-        """Resolve hostname and establish TCP connection.
-        
-        Tries: raw IPv4 → raw IPv6 → DNS resolution (IPv4 preferred).
-        """
-        # Try as raw IPv4 address
+        """Resolve hostname and establish TCP connection."""
         try:
             socket.inet_pton(socket.AF_INET, host)
             self.logger.info(f"Connecting to {host}:{port}")
@@ -176,7 +161,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except socket.error:
             pass
         
-        # Try as raw IPv6 address
         try:
             socket.inet_pton(socket.AF_INET6, host)
             try:
@@ -187,7 +171,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except socket.error:
             pass
         
-        # DNS resolution with IPv4 preference
         self.logger.info(f"Resolving {host}:{port}...")
         addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
@@ -206,29 +189,26 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     
     # ─── TCP Data Relay ──────────────────────────────────────────────
     
-    def _handle_tcp_data(self, client: str, session: Session, message: bytes) -> None:
-        """Relay TCP data between client and destination.
+    def _handle_tcp_data(self, client: str, session: Session, message: bytes, stream_id: str = None) -> None:
+        """Handle TCP data relay.
         
-        Flow:
-        1. Decompress incoming data from client
-        2. Forward to destination socket
-        3. Read available response from destination
-        4. Compress and send response back to client
-        
-        Responds immediately after reading available data (no waiting).
+        Args:
+            client: Client IP address
+            session: Tunnel session
+            message: Data payload
+            stream_id: Optional stream ID for multiplexed sessions.
+                       If provided, response is prefixed with stream_id.
         """
         session.touch()
         
         # Handle close request
         if message == MSG_CLOSE:
             self.logger.info(f"[{client}] Session {session.id} closed")
-            self.logger.debug(f"[{client}] Stats: {session.requests} req, "
-                            f"{session.bytes_sent}B sent, {session.bytes_received}B recv")
             self.sessions.remove(session.id)
-            self._send_encrypted(b"closed")
+            self._send_encrypted_with_stream(b"closed", stream_id)
             return
         
-        # Decompress incoming data (skip heartbeats and close)
+        # Decompress incoming data
         if message and message not in [MSG_HEARTBEAT, MSG_CLOSE]:
             if self.compression:
                 try:
@@ -236,7 +216,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
         
-        # Forward to destination with non-blocking send
+        # Forward to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 total_sent = 0
@@ -249,19 +229,18 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         else:
                             break
                     except BlockingIOError:
-                        # Socket buffer full, wait briefly
                         ready = select.select([], [session.socket], [], 0.1)
                         if not ready[1]:
                             break
             except (BrokenPipeError, ConnectionResetError, OSError):
                 self.sessions.remove(session.id)
-                self._send_encrypted(b"destination_closed")
+                self._send_encrypted_with_stream(b"destination_closed", stream_id)
                 return
         
         # Read response from destination
         response_data = self._read_from_socket(session)
         
-        # Compress response (skip if already encrypted/compressed)
+        # Compress response
         if response_data and response_data not in [b"destination_closed", b"closed"]:
             if self.compression and should_compress(b"", response_data):
                 try:
@@ -269,14 +248,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
         
-        self._send_encrypted(response_data if response_data else b"")
+        self._send_encrypted_with_stream(response_data if response_data else b"", stream_id)
     
     def _read_from_socket(self, session: Session) -> bytes:
-        """Read available data from destination socket.
-        
-        Returns immediately with whatever data is available.
-        Detects connection close (EOF) and cleans up session.
-        """
+        """Read available data from destination socket."""
         response_data = b""
         try:
             while True:
@@ -308,13 +283,9 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     # ─── UDP Data Relay ──────────────────────────────────────────────
     
     def _handle_udp_data(self, client: str, session: Session, data: bytes) -> None:
-        """Relay UDP data between client and destination.
-        
-        UDP is stateless - each message is independent.
-        """
+        """Handle UDP data relay."""
         session.touch()
         
-        # Forward UDP packet to destination
         if data and data not in [MSG_CLOSE, MSG_HEARTBEAT]:
             try:
                 addr = (session.host, session.port)
@@ -323,7 +294,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         
-        # Check for incoming UDP response
         response_data = b""
         try:
             ready = select.select([session.socket], [], [], 0.001)
@@ -334,7 +304,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except (BlockingIOError, socket.error):
             pass
         
-        # Compress if enabled and data exists
         if response_data and self.compression:
             try:
                 response_data = compress_data(response_data, COMPRESS_ZLIB, 100)
@@ -344,6 +313,21 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         self._send_encrypted(response_data if response_data else b"")
     
     # ─── Response Sending ────────────────────────────────────────────
+    
+    def _send_encrypted_with_stream(self, data: bytes, stream_id: str = None) -> None:
+        """Send encrypted response, optionally prefixed with stream_id.
+        
+        When stream_id is provided, the response is formatted as:
+        stream_id::data
+        
+        This allows the client to route the response to the correct
+        SOCKS5 connection in multiplexed sessions.
+        """
+        if stream_id:
+            # Prefix with stream_id for multiplexed sessions
+            data = stream_id.encode() + b"::" + data
+        
+        self._send_encrypted(data)
     
     def _send_encrypted(self, data: bytes) -> None:
         """Encrypt data and send as HTTP response."""
@@ -357,13 +341,13 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(token.encode())
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
-            pass  # Client disconnected - normal
+            pass
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Send error: {e}")
     
     def log_message(self, format, *args):
-        """Override to use custom logger (suppress 200 responses)."""
+        """Override to use custom logger."""
         if args and "200" not in str(args[0]):
             if self.logger:
                 self.logger.debug(f"[{self.client_address[0]}] {format % args}")
