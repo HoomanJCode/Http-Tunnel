@@ -3,7 +3,6 @@
 Configuration is auto-cleaned on load:
 - Invalid parameters (wrong type) are removed
 - Missing optional parameters get defaults
-- Required parameters without values are set to None
 
 Server and client have separate valid parameter sets.
 """
@@ -24,8 +23,6 @@ SERVER_CONFIG_PARAMS = {
     "udp_timeout": 120,            # UDP session timeout in seconds
     "cleanup_interval": 30,        # Stale session check interval
     "compression": True,           # Zlib compression enabled
-    "compress_threshold": 100,     # Minimum bytes to attempt compression
-    "tcp_nodelay": True,           # Disable Nagle's algorithm for lower latency
     "log_level": "INFO"            # Logging verbosity
 }
 
@@ -42,16 +39,9 @@ CLIENT_CONFIG_PARAMS = {
     # DNS
     "dns_mode": "server",          # DNS resolution: server or local
     
-    # Connection limits
-    "max_concurrent_requests": 15, # Max simultaneous HTTP requests (0=unlimited)
-    "max_socks_connections": 100,  # Max SOCKS5 connections (0=unlimited)
-    "connection_pool_hosts": 10,   # HTTP pool: max different hosts
-    "connection_pool_max": 15,     # HTTP pool: max connections per host
-    
     # Timing
     "http_timeout": 30,            # HTTP request timeout in seconds
-    "heartbeat_interval": 1,       # Keep-alive interval (adaptive min)
-    "heartbeat_max": 30,           # Keep-alive max after backoff
+    "heartbeat_interval": 1,       # Keep-alive interval (adaptive 1s-30s)
     "batch_wait": 0.01,            # Data batching delay (0=disable batching)
     "reconnect_delay": 0.5,        # Reconnection backoff base
     
@@ -62,10 +52,6 @@ CLIENT_CONFIG_PARAMS = {
     "compression": True,           # Zlib compression enabled
     "compress_threshold": 100,     # Minimum bytes to attempt compression
     "skip_compress_tls": True,     # Don't compress already-encrypted TLS data
-    
-    # Retry
-    "max_retries": 5,              # Max retries on proxy errors (502)
-    "retry_backoff": 2.0,          # Backoff multiplier for retries
     
     # Bypass
     "bypass_local": True,          # Bypass tunnel for localhost
@@ -161,7 +147,7 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     listen_addr = input("Listen address [0.0.0.0:8080]: ").strip()
     config["listen"] = listen_addr if listen_addr else "0.0.0.0:8080"
     
-    # Performance settings
+    # Performance
     print("\n--- Performance (press Enter for defaults) ---")
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
     _prompt_float(config, "tcp_timeout", "TCP session timeout (seconds)", 60)
@@ -170,12 +156,6 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
-    
-    if config["compression"]:
-        _prompt_int(config, "compress_threshold", "Compression threshold (bytes)", 100)
-    
-    tcp_nodelay = input("Enable TCP_NODELAY? (Y/n) [Y]: ").strip().lower()
-    config["tcp_nodelay"] = tcp_nodelay != 'n'
     
     # Logging
     print("\n--- Logging ---")
@@ -200,7 +180,7 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     
     print("\n=== Client Configuration Wizard ===\n")
     
-    # Encryption key
+    # Encryption
     print("--- Encryption ---")
     print("Enter a pre-shared key (or press Enter for random generated):")
     psk = input("PSK Key: ").strip()
@@ -209,12 +189,12 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
         print(f"Generated random PSK: {psk}")
     config["encryption_key"] = psk
     
-    # SOCKS5 settings
+    # SOCKS5
     print("\n--- SOCKS5 Proxy ---")
     socks_addr = input("SOCKS5 listen address [127.0.0.1:1080]: ").strip()
     config["socks_listen"] = socks_addr if socks_addr else "127.0.0.1:1080"
     
-    # Server connection
+    # Server
     print("\n--- Server Connection ---")
     server_url = input("Server URL [http://localhost:8080/tunnel]: ").strip()
     config["server_url"] = server_url if server_url else "http://localhost:8080/tunnel"
@@ -222,44 +202,29 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     outbound_proxy = input("Outbound HTTP proxy (leave empty for none): ").strip()
     config["outbound_http_proxy"] = outbound_proxy if outbound_proxy else ""
     
-    # DNS mode
-    print("\n--- DNS Configuration ---")
-    print("'server' mode prevents DNS leaks by resolving on server")
-    dns_mode = input("DNS resolution mode (local/server) [server]: ").strip().lower()
+    # DNS
+    print("\n--- DNS ---")
+    dns_mode = input("DNS mode (local/server) [server]: ").strip().lower()
     config["dns_mode"] = dns_mode if dns_mode in ["local", "server"] else "server"
-    
-    # Connection limits
-    print("\n--- Connection Limits (0 = unlimited) ---")
-    _prompt_int(config, "max_concurrent_requests", "Max concurrent HTTP requests", 15)
-    _prompt_int(config, "max_socks_connections", "Max SOCKS5 connections", 100)
-    _prompt_int(config, "connection_pool_hosts", "HTTP pool max hosts", 10)
-    _prompt_int(config, "connection_pool_max", "HTTP pool max per host", 15)
     
     # Timing
     print("\n--- Timing (press Enter for defaults) ---")
-    _prompt_float(config, "http_timeout", "HTTP request timeout (seconds)", 30)
+    _prompt_float(config, "http_timeout", "HTTP timeout (seconds)", 30)
     _prompt_float(config, "heartbeat_interval", "Heartbeat interval (seconds)", 1)
-    _prompt_float(config, "heartbeat_max", "Max heartbeat after backoff (seconds)", 30)
     _prompt_float(config, "batch_wait", "Batch wait (seconds, 0=disable)", 0.01)
     _prompt_float(config, "reconnect_delay", "Reconnect delay (seconds)", 0.5)
     
-    # Size limits
+    # Size
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
     
     # Compression
     print("\n--- Compression ---")
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
-    
     if config["compression"]:
         _prompt_int(config, "compress_threshold", "Compression threshold (bytes)", 100)
         skip_tls = input("Skip compression for TLS data? (Y/n) [Y]: ").strip().lower()
         config["skip_compress_tls"] = skip_tls != 'n'
-    
-    # Retry
-    print("\n--- Retry ---")
-    _prompt_int(config, "max_retries", "Max retries on errors", 5)
-    _prompt_float(config, "retry_backoff", "Retry backoff multiplier", 2.0)
     
     # Bypass
     print("\n--- Bypass ---")
@@ -293,12 +258,10 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
 
 
 def _prompt_int(config: dict, key: str, description: str, default: int) -> None:
-    """Prompt for integer configuration value."""
     value = input(f"{description} [{default}]: ").strip()
     config[key] = int(value) if value else default
 
 
 def _prompt_float(config: dict, key: str, description: str, default: float) -> None:
-    """Prompt for float configuration value."""
     value = input(f"{description} [{default}]: ").strip()
     config[key] = float(value) if value else default
