@@ -147,6 +147,7 @@ class SocksToHttpTunnel:
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
         
+        # Reject IPv6
         if atyp == 4:
             self.logger.debug(f"[{thread_id}] IPv6 rejected: {target_host}")
             conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -157,7 +158,10 @@ class SocksToHttpTunnel:
                 self.udp.handle(conn, target_host, target_port, thread_id)
             return
         
-        # Read first byte to detect protocol
+        # Send SOCKS5 success FIRST so the app starts sending data
+        conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
+        
+        # Now read first byte to detect protocol
         conn.setblocking(True)
         conn.settimeout(3)
         try:
@@ -165,6 +169,7 @@ class SocksToHttpTunnel:
             if first_byte_data:
                 first_byte = first_byte_data[0]
                 proto = detect_protocol_from_first_byte(first_byte)
+                self.logger.debug(f"[{thread_id}] First byte: 0x{first_byte:02x} -> {proto}")
             else:
                 proto = 'other'
                 first_byte_data = b''
@@ -192,7 +197,6 @@ class SocksToHttpTunnel:
     def _handle_direct(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         remote = None
         try:
-            local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
             remote = socket.create_connection((target_host, target_port), timeout=10)
             if first_byte:
                 remote.sendall(first_byte)
@@ -232,7 +236,6 @@ class SocksToHttpTunnel:
     def _handle_via_proxy(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         remote = None
         try:
-            local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
             proxy_url = self.config["outbound_http_proxy"]
             proxy_host = proxy_url.split("://")[1].split(":")[0] if "://" in proxy_url else proxy_url.split(":")[0]
             proxy_port = int(proxy_url.split(":")[-1]) if ":" in proxy_url.split("://")[-1] else 8080
@@ -286,10 +289,8 @@ class SocksToHttpTunnel:
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             if resp_data.get("status") != "ok":
                 self.logger.error(f"[{thread_id}] Refused: {resp_data.get('reason','?')}")
-                local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
             session_id = resp_data["session"]
-            local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
             self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
             local_conn.setblocking(False)
             buf = first_byte if first_byte else b""
