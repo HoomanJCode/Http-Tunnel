@@ -1,4 +1,4 @@
-"""HTTP request handler for tunnel server - raw TCP passthrough, no modification."""
+"""HTTP request handler for tunnel server - raw TCP passthrough."""
 
 import json
 import socket
@@ -15,15 +15,14 @@ from http_tunnel.server.session import Session, SessionManager
 class TunnelRequestHandler(BaseHTTPRequestHandler):
     """Handles HTTP POST requests for tunnel data relay.
     
-    CRITICAL: Data passes through UNMODIFIED. No compression, no parsing.
-    Raw TCP bytes in → raw TCP bytes out.
+    Raw passthrough: data flows unmodified.
+    Only encryption/decryption for transport security.
     """
     
     crypto: TunnelCrypto = None
     max_post_bytes: int = 5242880
     tcp_timeout: int = 60
     udp_timeout: int = 120
-    compression: bool = False  # DISABLED - causes TLS corruption
     logger = None
     
     sessions = SessionManager()
@@ -105,7 +104,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
     
     def _connect(self, host: str, port: int) -> socket.socket:
-        """Connect to host:port."""
         try:
             socket.inet_pton(socket.AF_INET, host)
             return socket.create_connection((host, port), timeout=10)
@@ -125,27 +123,19 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         try:
             addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except socket.gaierror:
-            raise OSError(f"DNS resolution failed for {host}")
+            raise OSError(f"DNS failed: {host}")
         addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
-        last_error = None
         for family, socktype, proto, canonname, sockaddr in addrs:
             try:
                 sock = socket.socket(family, socktype, proto)
                 sock.settimeout(10)
                 sock.connect(sockaddr)
                 return sock
-            except OSError as e:
-                last_error = e
+            except OSError:
                 continue
-        raise OSError(f"Could not connect to {host}:{port}: {last_error}")
+        raise OSError(f"Could not connect to {host}:{port}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """RAW passthrough - no compression, no modification.
-        
-        Forward client data to destination as-is.
-        Read response from destination as-is.
-        Send response to client as-is.
-        """
         session.touch()
         
         if message == MSG_CLOSE:
@@ -154,7 +144,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(b"closed")
             return
         
-        # Forward to destination - RAW, no decompression
+        # Forward raw to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -164,7 +154,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self._send(b"destination_closed")
                 return
         
-        # Read response - wait a bit for data
+        # Read raw response
         response = b""
         try:
             deadline = time.time() + 0.5
@@ -194,7 +184,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self.sessions.remove(session.id)
             response = b"destination_closed"
         
-        # Send RAW - no compression
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):

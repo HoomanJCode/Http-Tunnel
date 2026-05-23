@@ -1,4 +1,4 @@
-"""HTTP tunnel client - main orchestrator. Raw TCP passthrough, no modification."""
+"""HTTP tunnel client - raw TCP passthrough, no data modification."""
 
 import socket
 import time
@@ -25,17 +25,12 @@ from http_tunnel.client.udp import UdpRelay
 
 
 class SocksToHttpTunnel:
-    """Main client that bridges SOCKS5 to HTTP tunnel.
-    
-    RAW passthrough mode: No compression, no data modification.
-    Bytes in → bytes out. Only encryption for transport.
-    """
+    """Bridges SOCKS5 to HTTP tunnel. Raw passthrough, no data modification."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
             raise RuntimeError("Setup cancelled.")
         self.logger = setup_logging(self.config, "client")
-        self.logger.info("Loading client configuration...")
         self.crypto = TunnelCrypto(self.config["encryption_key"])
         self.server_url = self.config["server_url"]
         self.running = True
@@ -59,11 +54,11 @@ class SocksToHttpTunnel:
         self._setup_http_session()
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("SOCKS5 tunnel client initialized (raw passthrough mode)")
+        self.logger.info("Client ready")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
-            print(f"Config file {config_path} not found. Running setup wizard...")
+            print(f"Config {config_path} not found. Running wizard...")
             if not generate_client_config(config_path):
                 return False
         self.config = load_and_clean_config(config_path, "client")
@@ -79,12 +74,8 @@ class SocksToHttpTunnel:
     
     def _setup_http_session(self):
         self._session = requests.Session()
-        if self._using_proxy:
-            pool_hosts = 4
-            pool_max = 8
-        else:
-            pool_hosts = 50
-            pool_max = 100
+        pool_hosts = 4 if self._using_proxy else 50
+        pool_max = 8 if self._using_proxy else 100
         adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
         self._session.mount('http://', adapter)
         self._session.mount('https://', adapter)
@@ -106,8 +97,6 @@ class SocksToHttpTunnel:
                     time.sleep(self.reconnect_delay * (attempt + 1))
                     continue
                 raise
-            except Exception:
-                raise
     
     def should_bypass(self, host: str) -> bool:
         if self.bypass_local and host in ["127.0.0.1", "localhost", "::1"]:
@@ -123,124 +112,95 @@ class SocksToHttpTunnel:
     
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
-        if atyp == 4 and self.dns_mode == "server":
-            self.logger.debug(f"[{thread_id}] IPv6 address - may fail if server has no IPv6")
         if cmd == 1 and self.should_bypass(target_host):
             self.direct.handle(conn, target_host, target_port, thread_id)
         elif cmd == 1:
-            self._handle_tcp_connect(conn, target_host, target_port, thread_id)
+            self._handle_tcp(conn, target_host, target_port, thread_id)
         elif cmd == 3:
             self.udp.handle(conn, target_host, target_port, thread_id)
     
-    def _handle_tcp_connect(self, local_conn: socket.socket, target_host: str, target_port: int, thread_id: str):
+    def _handle_tcp(self, local_conn, target_host, target_port, thread_id):
         session_id = None
         try:
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
-            enc_connect = self.crypto.encrypt(connect_msg.encode())
-            resp = self.http_post(enc_connect, f"{thread_id}-connect")
+            resp = self.http_post(self.crypto.encrypt(connect_msg.encode()), f"{thread_id}-c")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             if resp_data.get("status") != "ok":
-                reason = resp_data.get('reason', 'Unknown')
-                if 'Network is unreachable' in reason or 'IPv6' in reason:
-                    self.logger.debug(f"[{thread_id}] Server cannot reach {target_host}:{target_port}")
-                else:
-                    self.logger.error(f"[{thread_id}] Server refused: {reason}")
+                self.logger.error(f"[{thread_id}] Refused: {resp_data.get('reason','?')}")
                 local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
             session_id = resp_data["session"]
-            response = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
-            local_conn.sendall(response)
-            self.logger.info(f"[{thread_id}] Tunnel: {session_id} -> {target_host}:{target_port}")
+            local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
+            self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
             local_conn.setblocking(False)
-            buffer_out = b""
-            last_send = time.time()
-            current_heartbeat = self.heartbeat_interval
-            if self._using_proxy:
-                batch_wait = 0
-            else:
-                batch_wait = self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0
+            buf = b""
+            last = time.time()
+            hb = self.heartbeat_interval
+            bw = 0 if self._using_proxy else (self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0)
             while self.running and session_id:
                 now = time.time()
                 try:
                     while True:
-                        chunk = local_conn.recv(8192)
-                        if not chunk:
+                        c = local_conn.recv(8192)
+                        if not c:
                             self.logger.info(f"[{thread_id}] Closed")
-                            self._send_close(session_id)
+                            self._close(session_id)
                             return
-                        buffer_out += chunk
-                        if len(buffer_out) >= self.max_bytes - 2000:
+                        buf += c
+                        if len(buf) >= self.max_bytes - 2000:
                             break
                 except BlockingIOError:
                     pass
                 except:
                     return
-                should_send = False
-                if len(buffer_out) > 0:
-                    if batch_wait == 0 or len(buffer_out) >= self.max_bytes - 2000 or (now - last_send) >= batch_wait:
-                        should_send = True
-                elif (now - last_send) >= current_heartbeat:
-                    should_send = True
-                if should_send:
-                    if len(buffer_out) > 0:
-                        payload = buffer_out[:self.max_bytes - 2000]
-                        buffer_out = buffer_out[self.max_bytes - 2000:]
-                        current_heartbeat = self.heartbeat_interval
-                    else:
-                        payload = MSG_HEARTBEAT
-                        current_heartbeat = min(current_heartbeat * 1.5, 15 if self._using_proxy else 30)
-                    # RAW: no compression, send as-is
-                    session_message = create_session_message(session_id, payload)
-                    enc_message = self.crypto.encrypt(session_message)
+                send = False
+                if len(buf) > 0:
+                    if bw == 0 or len(buf) >= self.max_bytes - 2000 or (now - last) >= bw:
+                        send = True
+                elif (now - last) >= hb:
+                    send = True
+                if send:
+                    payload = buf[:self.max_bytes - 2000] if buf else MSG_HEARTBEAT
+                    buf = buf[self.max_bytes - 2000:] if buf else b""
+                    hb = self.heartbeat_interval if buf else min(hb * 1.5, 15 if self._using_proxy else 30)
                     try:
-                        resp_text = self.http_post(enc_message, f"{thread_id}")
-                        plain_response = self.crypto.decrypt(resp_text)
-                        if plain_response == b"destination_closed":
-                            self.logger.info(f"[{thread_id}] Remote closed")
+                        resp_text = self.http_post(self.crypto.encrypt(create_session_message(session_id, payload)), f"{thread_id}")
+                        plain = self.crypto.decrypt(resp_text)
+                        if plain in [b"destination_closed", b"invalid_session", b"closed"]:
+                            self.logger.info(f"[{thread_id}] {plain.decode()}")
                             return
-                        elif plain_response == b"invalid_session":
-                            self.logger.error(f"[{thread_id}] Session expired")
-                            return
-                        elif plain_response == b"closed":
-                            return
-                        elif plain_response and len(plain_response) > 0:
-                            # RAW: no decompression, forward as-is
+                        if plain:
                             try:
-                                local_conn.sendall(plain_response)
+                                local_conn.sendall(plain)
                             except:
                                 return
-                        last_send = now
+                        last = now
                     except Exception as e:
-                        self.logger.error(f"[{thread_id}] Error: {e}")
+                        self.logger.error(f"[{thread_id}] {e}")
                         time.sleep(self.reconnect_delay)
-                        continue
                 time.sleep(0.001)
         except Exception as e:
-            self.logger.error(f"[{thread_id}] Tunnel error: {e}")
+            self.logger.error(f"[{thread_id}] {e}")
         finally:
             if session_id:
-                self._send_close(session_id)
+                self._close(session_id)
     
-    def _send_close(self, session_id: str):
+    def _close(self, sid):
         try:
-            close_msg = create_session_message(session_id, MSG_CLOSE)
-            enc_close = self.crypto.encrypt(close_msg)
-            self.http_post(enc_close, "close")
+            self.http_post(self.crypto.encrypt(create_session_message(sid, MSG_CLOSE)), "close")
         except:
             pass
     
     def start(self):
-        self.logger.info(f"SOCKS5 on {self.socks_host}:{self.socks_port} -> {self.server_url}")
-        if self._using_proxy:
-            self.logger.info(f"Relay proxy mode: reduced pool, instant send")
-        self.logger.info(f"DNS: {self.dns_mode} | Raw passthrough (no compression)")
-        self.logger.info(f"Use: curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
-        socks_server = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
-        socks_server.start()
+        self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
+        self.logger.info(f"DNS: {self.dns_mode} | Raw passthrough")
+        self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
+        s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
+        s.start()
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.logger.info("Shutting down...")
             self.running = False
-            socks_server.stop()
+            s.stop()
