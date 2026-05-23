@@ -1,6 +1,7 @@
 """HTTP tunnel client - main orchestrator.
 
 Bridges local SOCKS5 proxy to remote HTTP tunnel server.
+Features connection pooling to reuse tunnel sessions for same host:port.
 All behavior is configurable via client_config.json.
 """
 
@@ -27,12 +28,15 @@ from http_tunnel.logging import setup_logging
 from http_tunnel.client.socks import Socks5Server
 from http_tunnel.client.direct import DirectConnector
 from http_tunnel.client.udp import UdpRelay
+from http_tunnel.client.pool import ConnectionPool
 
 
 class SocksToHttpTunnel:
     """Main client that bridges SOCKS5 to HTTP tunnel.
     
-    All tunable parameters come from client_config.json.
+    Uses connection pooling to reuse tunnel sessions when multiple
+    connections go to the same host:port, dramatically reducing
+    HTTP requests and server connections.
     """
     
     def __init__(self, config_path: str = "client_config.json"):
@@ -57,7 +61,7 @@ class SocksToHttpTunnel:
             }
             self._using_proxy = True
         
-        # Connection limits (0 = unlimited)
+        # Connection limits
         self.max_concurrent = self.config["max_concurrent_requests"]
         self.max_socks = self.config["max_socks_connections"]
         self.pool_hosts = self.config["connection_pool_hosts"]
@@ -90,7 +94,7 @@ class SocksToHttpTunnel:
         # QoS
         self.high_priority_ports = self.config["high_priority_ports"]
         
-        # SOCKS5 address
+        # SOCKS5
         socks_addr = self.config["socks_listen"].split(":")
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
@@ -106,6 +110,20 @@ class SocksToHttpTunnel:
         
         # HTTP session
         self._setup_http_session()
+        
+        # Connection pool for tunnel session reuse
+        self.pool = ConnectionPool(
+            max_sessions_per_host=3,
+            max_total_sessions=50,
+            idle_timeout=60
+        )
+        
+        # Pool cleanup thread
+        def pool_cleaner():
+            while self.running:
+                time.sleep(10)
+                self.pool.cleanup_idle()
+        threading.Thread(target=pool_cleaner, daemon=True).start()
         
         # Components
         self.direct = DirectConnector(self)
@@ -159,7 +177,6 @@ class SocksToHttpTunnel:
             "Connection": "keep-alive",
         }
         
-        # Acquire semaphore if limiting is enabled
         if self._request_semaphore:
             acquired = self._request_semaphore.acquire(timeout=self.http_timeout)
             if not acquired:
@@ -204,18 +221,16 @@ class SocksToHttpTunnel:
     
     def should_bypass(self, host: str) -> bool:
         """Check if host should bypass tunnel based on configured ranges."""
-        # Check localhost
         if self.bypass_local and host in ["127.0.0.1", "localhost", "::1"]:
             return True
         
-        # Check bypass ranges
         try:
             ip = ipaddress.ip_address(host)
             for network in self.bypass_networks:
                 if ip in network:
                     return True
         except ValueError:
-            pass  # Hostname, not IP
+            pass
         
         return False
     
@@ -233,26 +248,47 @@ class SocksToHttpTunnel:
     
     def _handle_tcp_connect(self, local_conn: socket.socket, target_host: str,
                            target_port: int, thread_id: str):
-        """Handle TCP CONNECT through HTTP tunnel."""
-        session_id = None
+        """Handle TCP CONNECT through HTTP tunnel with connection pooling."""
         
-        try:
-            connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
+        # Try to reuse existing session for this host:port
+        def create_new_session(host, port):
+            """Create a new tunnel session on server."""
+            connect_msg = create_connect_message(host, port, PROTO_TCP)
             enc_connect = self.crypto.encrypt(connect_msg.encode())
             resp = self.http_post(enc_connect, f"{thread_id}-connect")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
-            
-            if resp_data.get("status") != "ok":
-                self.logger.error(f"[{thread_id}] Server refused: {resp_data.get('reason')}")
-                local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
-                return
-            
-            session_id = resp_data["session"]
-            
+            if resp_data.get("status") == "ok":
+                return resp_data["session"]
+            return None
+        
+        session_id, stream_id, is_new = self.pool.get_or_create_session(
+            target_host, target_port, create_new_session
+        )
+        
+        if not session_id:
+            self.logger.error(f"[{thread_id}] Failed to get session for {target_host}:{target_port}")
+            local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
+        
+        # Register this stream's socket in the pool session
+        session = self.pool.sessions.get(session_id)
+        if session:
+            session.add_stream(stream_id, local_conn)
+        
+        if is_new:
+            self.logger.info(f"[{thread_id}] New session {session_id} for {target_host}:{target_port}")
+        else:
+            self.logger.info(f"[{thread_id}] Reusing session {session_id} for {target_host}:{target_port}")
+            # Show pool stats periodically
+            stats = self.pool.get_stats()
+            self.logger.debug(f"Pool: {stats['sessions']} sessions, {stats['streams']} streams, {stats['hosts']} hosts")
+        
+        try:
+            # Send SOCKS5 success
             response = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
             local_conn.sendall(response)
-            self.logger.info(f"[{thread_id}] Tunnel: {session_id}")
             
+            # Data relay loop
             local_conn.setblocking(False)
             buffer_out = b""
             last_send = time.time()
@@ -261,11 +297,7 @@ class SocksToHttpTunnel:
             request_count = 0
             current_heartbeat = self.heartbeat_interval
             
-            # QoS: faster batching for high priority ports
-            if target_port in self.high_priority_ports:
-                batch_wait = self.batch_wait * 0.5 if self.batch_wait > 0 else 0
-            else:
-                batch_wait = self.batch_wait
+            batch_wait = self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0
             
             while self.running and session_id:
                 now = time.time()
@@ -285,10 +317,8 @@ class SocksToHttpTunnel:
                 except:
                     return
                 
-                # Decide whether to send
                 should_send = False
                 if len(buffer_out) > 0:
-                    # Send immediately if batching disabled, or buffer full, or wait elapsed
                     if batch_wait == 0 or len(buffer_out) >= self.max_bytes - 2000 or (now - last_send) >= batch_wait:
                         should_send = True
                 elif (now - last_send) >= current_heartbeat:
@@ -299,7 +329,6 @@ class SocksToHttpTunnel:
                         payload = buffer_out[:self.max_bytes - 2000]
                         buffer_out = buffer_out[self.max_bytes - 2000:]
                         
-                        # Compress if enabled and beneficial
                         if self.compression and len(payload) > self.compress_threshold:
                             if not self.skip_compress_tls or not is_tls_data(payload):
                                 try:
@@ -355,6 +384,7 @@ class SocksToHttpTunnel:
         except Exception as e:
             self.logger.error(f"[{thread_id}] Tunnel error: {e}")
         finally:
+            self.pool.close_stream(session_id, stream_id)
             if session_id:
                 self._send_close(session_id, f"{thread_id}-final-close")
     
@@ -385,6 +415,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 on {self.socks_host}:{self.socks_port} → {self.server_url}")
         self.logger.info(f"DNS: {self.dns_mode} | {limit_info} | {socks_info}")
         self.logger.info(f"Pool: {self.pool_hosts}/{self.pool_max} | {batch_info} | Retries: {self.max_retries}")
+        self.logger.info(f"Session reuse: ON (max 3 per host, 50 total)")
         if self.bypass_ranges:
             self.logger.info(f"Bypass: {', '.join(self.bypass_ranges[:3])}" + 
                            (f" +{len(self.bypass_ranges)-3} more" if len(self.bypass_ranges) > 3 else ""))
