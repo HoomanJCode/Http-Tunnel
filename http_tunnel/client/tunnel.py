@@ -1,4 +1,4 @@
-"""HTTP tunnel client - main orchestrator. Simple, one tunnel per connection."""
+"""HTTP tunnel client - main orchestrator. Raw TCP passthrough, no modification."""
 
 import socket
 import time
@@ -13,10 +13,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from http_tunnel.crypto import TunnelCrypto
-from http_tunnel.compression import compress_data, decompress_data, COMPRESS_ZLIB
 from http_tunnel.protocol import (
-    PROTO_TCP, PROTO_UDP, create_connect_message, create_ping_message,
-    create_session_message, MSG_CLOSE, MSG_HEARTBEAT, is_tls_data
+    PROTO_TCP, PROTO_UDP, create_connect_message,
+    create_session_message, MSG_CLOSE, MSG_HEARTBEAT
 )
 from http_tunnel.config import generate_client_config, load_and_clean_config
 from http_tunnel.logging import setup_logging
@@ -26,7 +25,11 @@ from http_tunnel.client.udp import UdpRelay
 
 
 class SocksToHttpTunnel:
-    """Main client that bridges SOCKS5 to HTTP tunnel."""
+    """Main client that bridges SOCKS5 to HTTP tunnel.
+    
+    RAW passthrough mode: No compression, no data modification.
+    Bytes in → bytes out. Only encryption for transport.
+    """
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -46,9 +49,6 @@ class SocksToHttpTunnel:
         self.batch_wait = self.config["batch_wait"]
         self.reconnect_delay = self.config["reconnect_delay"]
         self.max_bytes = self.config["max_post_bytes"]
-        self.compression = self.config["compression"]
-        self.compress_threshold = self.config.get("compress_threshold", 100)
-        self.skip_compress_tls = self.config.get("skip_compress_tls", True)
         self.bypass_local = self.config["bypass_local"]
         self._setup_bypass_networks()
         self.high_priority_ports = self.config.get("high_priority_ports", [22, 80, 443, 8080])
@@ -59,7 +59,7 @@ class SocksToHttpTunnel:
         self._setup_http_session()
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("SOCKS5 tunnel client initialized")
+        self.logger.info("SOCKS5 tunnel client initialized (raw passthrough mode)")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -185,16 +185,11 @@ class SocksToHttpTunnel:
                     if len(buffer_out) > 0:
                         payload = buffer_out[:self.max_bytes - 2000]
                         buffer_out = buffer_out[self.max_bytes - 2000:]
-                        if self.compression and len(payload) > self.compress_threshold:
-                            if not self.skip_compress_tls or not is_tls_data(payload):
-                                try:
-                                    payload = compress_data(payload, COMPRESS_ZLIB, self.compress_threshold)
-                                except:
-                                    pass
                         current_heartbeat = self.heartbeat_interval
                     else:
                         payload = MSG_HEARTBEAT
                         current_heartbeat = min(current_heartbeat * 1.5, 15 if self._using_proxy else 30)
+                    # RAW: no compression, send as-is
                     session_message = create_session_message(session_id, payload)
                     enc_message = self.crypto.encrypt(session_message)
                     try:
@@ -209,14 +204,7 @@ class SocksToHttpTunnel:
                         elif plain_response == b"closed":
                             return
                         elif plain_response and len(plain_response) > 0:
-                            # Server sends data uncompressed now, so just decompress if needed
-                            if len(plain_response) > 1 and plain_response[0] in [0x00, 0x01]:
-                                try:
-                                    decompressed = decompress_data(plain_response)
-                                    if decompressed:
-                                        plain_response = decompressed
-                                except:
-                                    pass
+                            # RAW: no decompression, forward as-is
                             try:
                                 local_conn.sendall(plain_response)
                             except:
@@ -244,8 +232,8 @@ class SocksToHttpTunnel:
     def start(self):
         self.logger.info(f"SOCKS5 on {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
-            self.logger.info(f"Relay proxy mode: reduced pool, instant send, moderate heartbeat")
-        self.logger.info(f"DNS: {self.dns_mode} | Compression: {'ON' if self.compression else 'OFF'}")
+            self.logger.info(f"Relay proxy mode: reduced pool, instant send")
+        self.logger.info(f"DNS: {self.dns_mode} | Raw passthrough (no compression)")
         self.logger.info(f"Use: curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         socks_server = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         socks_server.start()

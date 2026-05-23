@@ -1,4 +1,4 @@
-"""HTTP request handler for tunnel server - simple and clean."""
+"""HTTP request handler for tunnel server - raw TCP passthrough, no modification."""
 
 import json
 import socket
@@ -8,19 +8,22 @@ from http.server import BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
 from http_tunnel.crypto import TunnelCrypto
-from http_tunnel.compression import decompress_data
 from http_tunnel.protocol import PROTO_TCP, PROTO_UDP, MSG_CLOSE, MSG_HEARTBEAT
 from http_tunnel.server.session import Session, SessionManager
 
 
 class TunnelRequestHandler(BaseHTTPRequestHandler):
-    """Handles HTTP POST requests for tunnel data relay."""
+    """Handles HTTP POST requests for tunnel data relay.
+    
+    CRITICAL: Data passes through UNMODIFIED. No compression, no parsing.
+    Raw TCP bytes in → raw TCP bytes out.
+    """
     
     crypto: TunnelCrypto = None
     max_post_bytes: int = 5242880
     tcp_timeout: int = 60
     udp_timeout: int = 120
-    compression: bool = True
+    compression: bool = False  # DISABLED - causes TLS corruption
     logger = None
     
     sessions = SessionManager()
@@ -102,13 +105,12 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
     
     def _connect(self, host: str, port: int) -> socket.socket:
-        """Connect to host:port. Tries IPv4 first, then hostname resolution."""
+        """Connect to host:port."""
         try:
             socket.inet_pton(socket.AF_INET, host)
             return socket.create_connection((host, port), timeout=10)
         except socket.error:
             pass
-        
         try:
             socket.inet_pton(socket.AF_INET6, host)
             try:
@@ -120,14 +122,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 raise OSError(f"IPv6 not available: {e}")
         except socket.error:
             pass
-        
         try:
             addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except socket.gaierror:
             raise OSError(f"DNS resolution failed for {host}")
-        
         addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
-        
         last_error = None
         for family, socktype, proto, canonname, sockaddr in addrs:
             try:
@@ -138,11 +137,15 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             except OSError as e:
                 last_error = e
                 continue
-        
         raise OSError(f"Could not connect to {host}:{port}: {last_error}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """Handle TCP data relay - simple pass-through, no modification."""
+        """RAW passthrough - no compression, no modification.
+        
+        Forward client data to destination as-is.
+        Read response from destination as-is.
+        Send response to client as-is.
+        """
         session.touch()
         
         if message == MSG_CLOSE:
@@ -151,14 +154,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(b"closed")
             return
         
-        # Decompress incoming data from client (if compressed)
-        if message and message != MSG_HEARTBEAT:
-            try:
-                message = decompress_data(message)
-            except:
-                pass
-        
-        # Forward raw data to destination - DO NOT MODIFY
+        # Forward to destination - RAW, no decompression
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -168,11 +164,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self._send(b"destination_closed")
                 return
         
-        # Read response from destination - wait briefly for data
+        # Read response - wait a bit for data
         response = b""
         try:
-            # Wait up to 300ms for response data
-            deadline = time.time() + 0.3
+            deadline = time.time() + 0.5
             while time.time() < deadline:
                 ready = select.select([session.socket], [], [], 0.05)
                 if ready[0]:
@@ -186,8 +181,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         session.record_received(len(chunk))
                         if len(response) >= self.max_post_bytes - 2000:
                             break
-                        # Got data - wait a bit more for remaining fragments
-                        deadline = min(deadline, time.time() + 0.15)
+                        deadline = min(deadline, time.time() + 0.2)
                     except BlockingIOError:
                         break
                     except (ConnectionResetError, BrokenPipeError):
@@ -200,7 +194,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self.sessions.remove(session.id)
             response = b"destination_closed"
         
-        # Send response as-is - NO MODIFICATION
+        # Send RAW - no compression
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
