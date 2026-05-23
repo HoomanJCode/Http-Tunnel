@@ -1,4 +1,4 @@
-"""HTTP tunnel client - main orchestrator. Simple, one tunnel per connection."""
+"""HTTP tunnel client - main orchestrator. Tuned for relay proxy stability."""
 
 import socket
 import time
@@ -26,7 +26,13 @@ from http_tunnel.client.udp import UdpRelay
 
 
 class SocksToHttpTunnel:
-    """Main client that bridges SOCKS5 to HTTP tunnel."""
+    """Main client that bridges SOCKS5 to HTTP tunnel.
+    
+    Tuned for relay proxies (MasterHttpRelayVpn, etc.):
+    - http_timeout MUST be less than relay_timeout
+    - Heartbeat interval should be moderate to avoid flooding proxy
+    - Connection pool sized for relay proxy limits
+    """
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -36,14 +42,26 @@ class SocksToHttpTunnel:
         self.crypto = TunnelCrypto(self.config["encryption_key"])
         self.server_url = self.config["server_url"]
         self.running = True
+        
+        # Proxy settings
         self.proxies = {}
+        self._using_proxy = False
         if self.config.get("outbound_http_proxy"):
             self.proxies = {"http": self.config["outbound_http_proxy"], "https": self.config["outbound_http_proxy"]}
+            self._using_proxy = True
+        
+        # Timing - CRITICAL: http_timeout must be LESS than relay_timeout
         self.http_timeout = self.config["http_timeout"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
         self.batch_wait = self.config["batch_wait"]
         self.reconnect_delay = self.config["reconnect_delay"]
         self.max_bytes = self.config["max_post_bytes"]
+        
+        # If using proxy, warn about timeout mismatch
+        if self._using_proxy and self.http_timeout > 50:
+            self.logger.warning(f"http_timeout ({self.http_timeout}s) may exceed proxy relay_timeout!")
+            self.logger.warning("If connections fail, reduce http_timeout to 45 or lower")
+        
         self.compression = self.config["compression"]
         self.compress_threshold = self.config.get("compress_threshold", 100)
         self.skip_compress_tls = self.config.get("skip_compress_tls", True)
@@ -76,28 +94,56 @@ class SocksToHttpTunnel:
                 pass
     
     def _setup_http_session(self):
+        """Create HTTP session with conservative pool for relay proxies."""
         self._session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=100, max_retries=0, pool_block=False)
+        
+        # Relay proxies handle requests sequentially - smaller pool prevents overload
+        if self._using_proxy:
+            pool_hosts = 4
+            pool_max = 8
+        else:
+            pool_hosts = 50
+            pool_max = 100
+        
+        adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
         self._session.mount('http://', adapter)
         self._session.mount('https://', adapter)
     
     def http_post(self, body: str, context: str = "unknown") -> str:
+        """Send POST request with relay-aware retry logic.
+        
+        For relay proxies: fewer retries, shorter timeouts, detect 502 quickly.
+        """
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
-        for attempt in range(3):
+        
+        # Relay proxies: only retry once (502 means relay timed out)
+        max_attempts = 2 if self._using_proxy else 3
+        
+        for attempt in range(max_attempts):
             try:
                 resp = self._session.post(self.server_url, data=body, headers=headers,
-                                         proxies=self.proxies if self.proxies else None, timeout=self.http_timeout)
-                if resp.status_code == 502 and attempt < 2:
-                    time.sleep(self.reconnect_delay * (attempt + 1))
-                    continue
+                                         proxies=self.proxies if self.proxies else None,
+                                         timeout=self.http_timeout)
+                
+                # 502 from relay proxy = relay timed out. Don't retry aggressively.
+                if resp.status_code == 502:
+                    if attempt < max_attempts - 1:
+                        time.sleep(self.reconnect_delay * (attempt + 1))
+                        continue
+                    raise Exception("Relay proxy returned 502 - request timed out at relay")
+                
                 resp.raise_for_status()
                 return resp.text
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                if attempt < 2:
+                
+            except requests.exceptions.Timeout:
+                if attempt < max_attempts - 1:
                     time.sleep(self.reconnect_delay * (attempt + 1))
                     continue
                 raise
-            except Exception:
+            except requests.exceptions.ConnectionError:
+                if attempt < max_attempts - 1:
+                    time.sleep(self.reconnect_delay * (attempt + 1))
+                    continue
                 raise
     
     def should_bypass(self, host: str) -> bool:
@@ -115,7 +161,6 @@ class SocksToHttpTunnel:
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
         
-        # Warn if IPv6 address received (application resolved DNS locally)
         if atyp == 4 and self.dns_mode == "server":
             self.logger.debug(f"[{thread_id}] IPv6 address - may fail if server has no IPv6")
         
@@ -135,7 +180,6 @@ class SocksToHttpTunnel:
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             if resp_data.get("status") != "ok":
                 reason = resp_data.get('reason', 'Unknown')
-                # Suppress log spam for expected failures
                 if 'Network is unreachable' in reason or 'IPv6' in reason:
                     self.logger.debug(f"[{thread_id}] Server cannot reach {target_host}:{target_port}")
                 else:
@@ -149,8 +193,17 @@ class SocksToHttpTunnel:
             local_conn.setblocking(False)
             buffer_out = b""
             last_send = time.time()
+            
+            # Heartbeat: moderate for relay proxies to avoid flooding
             current_heartbeat = self.heartbeat_interval
-            batch_wait = self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0
+            heartbeat_max = 15
+            
+            # Batching: disabled for relay proxies (send immediately)
+            if self._using_proxy:
+                batch_wait = 0
+            else:
+                batch_wait = self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0
+            
             while self.running and session_id:
                 now = time.time()
                 try:
@@ -167,12 +220,14 @@ class SocksToHttpTunnel:
                     pass
                 except:
                     return
+                
                 should_send = False
                 if len(buffer_out) > 0:
                     if batch_wait == 0 or len(buffer_out) >= self.max_bytes - 2000 or (now - last_send) >= batch_wait:
                         should_send = True
                 elif (now - last_send) >= current_heartbeat:
                     should_send = True
+                
                 if should_send:
                     if len(buffer_out) > 0:
                         payload = buffer_out[:self.max_bytes - 2000]
@@ -186,7 +241,8 @@ class SocksToHttpTunnel:
                         current_heartbeat = self.heartbeat_interval
                     else:
                         payload = MSG_HEARTBEAT
-                        current_heartbeat = min(current_heartbeat * 1.5, 30)
+                        current_heartbeat = min(current_heartbeat * 1.5, heartbeat_max)
+                    
                     session_message = create_session_message(session_id, payload)
                     enc_message = self.crypto.encrypt(session_message)
                     try:
@@ -234,7 +290,10 @@ class SocksToHttpTunnel:
     
     def start(self):
         self.logger.info(f"SOCKS5 on {self.socks_host}:{self.socks_port} → {self.server_url}")
+        if self._using_proxy:
+            self.logger.info(f"Relay proxy mode: reduced pool, instant send, moderate heartbeat")
         self.logger.info(f"DNS: {self.dns_mode} | Compression: {'ON' if self.compression else 'OFF'}")
+        self.logger.info(f"http_timeout: {self.http_timeout}s | heartbeat: {self.heartbeat_interval}s")
         self.logger.info(f"Use: curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         socks_server = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         socks_server.start()
