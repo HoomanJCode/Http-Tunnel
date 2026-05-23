@@ -134,12 +134,22 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         raise OSError(f"Could not connect to {host}:{port}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
+        """Handle TCP data relay.
+        
+        After forwarding data to destination, reads response with adaptive timing:
+        - First read after forwarding: wait up to 2s (TLS handshake can be slow)
+        - Subsequent reads: wait up to 0.3s (application data is faster)
+        - Uses session.requests count to detect if this is first exchange
+        """
         session.touch()
+        
         if message == MSG_CLOSE:
             self.logger.info(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
             self._send(b"closed")
             return
+        
+        # Forward raw data to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -148,9 +158,16 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self.sessions.remove(session.id)
                 self._send(b"destination_closed")
                 return
+        
+        # Read response with adaptive timeout
+        # First few exchanges (TLS handshake) need longer wait
+        is_early = session.requests < 5
+        max_wait = 2.0 if is_early else 0.3
+        extend_wait = 0.5 if is_early else 0.1
+        
         response = b""
         try:
-            deadline = time.time() + 0.5
+            deadline = time.time() + max_wait
             while time.time() < deadline:
                 ready = select.select([session.socket], [], [], 0.05)
                 if ready[0]:
@@ -164,7 +181,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         session.record_received(len(chunk))
                         if len(response) >= self.max_post_bytes - 2000:
                             break
-                        deadline = min(deadline, time.time() + 0.2)
+                        # Got data - extend deadline for more fragments
+                        deadline = min(deadline, time.time() + extend_wait)
                     except BlockingIOError:
                         break
                     except (ConnectionResetError, BrokenPipeError):
@@ -172,10 +190,13 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         response = b"destination_closed"
                         break
                 else:
-                    break
+                    # No data yet - keep waiting if we haven't received anything
+                    if response:
+                        break
         except:
             self.sessions.remove(session.id)
             response = b"destination_closed"
+        
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
