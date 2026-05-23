@@ -17,6 +17,25 @@ from http_tunnel.protocol import (
     PROTO_TCP, PROTO_UDP, create_connect_message,
     create_session_message, MSG_CLOSE, MSG_HEARTBEAT
 )
+from http_tunnel.config import generate_client_config, load_and_clean_"""HTTP tunnel client - protocol-aware routing."""
+
+import socket
+import time
+import threading
+import logging
+import json
+import os
+import ipaddress
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from http_tunnel.crypto import TunnelCrypto
+from http_tunnel.protocol import (
+    PROTO_TCP, PROTO_UDP, create_connect_message,
+    create_session_message, MSG_CLOSE, MSG_HEARTBEAT
+)
 from http_tunnel.config import generate_client_config, load_and_clean_config
 from http_tunnel.logging import setup_logging
 from http_tunnel.client.socks import Socks5Server
@@ -24,27 +43,26 @@ from http_tunnel.client.direct import DirectConnector
 from http_tunnel.client.udp import UdpRelay
 
 
-def detect_protocol(first_bytes: bytes) -> str:
-    """Detect protocol from first bytes of connection.
+def detect_protocol_from_first_byte(first_byte: int) -> str:
+    """Detect protocol from first byte of connection.
     
-    Returns: 'tls', 'http', 'socks5', 'ssh', 'mtproto', 'unknown'
+    Returns: 'tls', 'http', 'other'
     """
-    if not first_bytes:
-        return 'unknown'
-    b = first_bytes[0]
-    if b == 0x16 or b == 0x17:
+    if first_byte == 0x16 or first_byte == 0x17:
         return 'tls'
-    if b == 0x05:
-        return 'socks5'
-    if b == 0xef:
-        return 'mtproto'
-    if first_bytes.startswith(b'GET ') or first_bytes.startswith(b'POST ') or \
-       first_bytes.startswith(b'HEAD ') or first_bytes.startswith(b'PUT ') or \
-       first_bytes.startswith(b'DELETE ') or first_bytes.startswith(b'CONNECT '):
+    if first_byte == 0x47:  # 'G' for GET
         return 'http'
-    if first_bytes.startswith(b'SSH-'):
-        return 'ssh'
-    return 'unknown'
+    if first_byte == 0x50:  # 'P' for POST
+        return 'http'
+    if first_byte == 0x48:  # 'H' for HEAD
+        return 'http'
+    if first_byte == 0x43:  # 'C' for CONNECT
+        return 'http'
+    if first_byte == 0x44:  # 'D' for DELETE
+        return 'http'
+    if first_byte == 0x50:  # 'P' for PUT/PATCH
+        return 'http'
+    return 'other'
 
 
 class SocksToHttpTunnel:
@@ -69,7 +87,6 @@ class SocksToHttpTunnel:
         self.max_bytes = self.config["max_post_bytes"]
         self.bypass_local = self.config["bypass_local"]
         self._setup_bypass_networks()
-        # Protocol-based routing
         self.route_tls = self.config.get("route_tls", "tunnel")
         self.route_http = self.config.get("route_http", "tunnel")
         self.route_other = self.config.get("route_other", "tunnel")
@@ -101,7 +118,6 @@ class SocksToHttpTunnel:
     
     def _setup_http_session(self):
         self._session = requests.Session()
-        # Larger pool for relay proxy to handle browser concurrency
         pool_hosts = 10 if self._using_proxy else 50
         pool_max = 20 if self._using_proxy else 100
         adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
@@ -151,8 +167,8 @@ class SocksToHttpTunnel:
         
         # Reject IPv6 when server has no IPv6 connectivity
         if atyp == 4:
-            self.logger.debug(f"[{thread_id}] IPv6 rejected: {target_host} (server has no IPv6)")
-            conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # Host unreachable
+            self.logger.debug(f"[{thread_id}] IPv6 rejected: {target_host}")
+            conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         
         if cmd != 1:
@@ -160,37 +176,47 @@ class SocksToHttpTunnel:
                 self.udp.handle(conn, target_host, target_port, thread_id)
             return
         
-        # Peek at first bytes to detect protocol
+        # Detect protocol by reading first byte (without MSG_PEEK)
+        # Read 1 byte, then prepend it back when forwarding
         conn.setblocking(True)
         conn.settimeout(3)
         try:
-            first_bytes = conn.recv(4096, socket.MSG_PEEK)
+            first_byte_data = conn.recv(1)
+            if first_byte_data:
+                first_byte = first_byte_data[0]
+                proto = detect_protocol_from_first_byte(first_byte)
+            else:
+                proto = 'other'
+                first_byte_data = b''
         except socket.timeout:
-            first_bytes = b""
+            proto = 'other'
+            first_byte_data = b''
         except:
-            first_bytes = b""
+            proto = 'other'
+            first_byte_data = b''
         conn.setblocking(True)
         conn.settimeout(10)
         
-        proto = detect_protocol(first_bytes)
         route = self._get_route_for_protocol(proto)
-        
         self.logger.info(f"[{thread_id}] {proto}:{target_port} -> {route} ({target_host}:{target_port})")
         
         if route == "direct":
-            self._handle_direct(conn, target_host, target_port, thread_id)
+            self._handle_direct(conn, target_host, target_port, thread_id, first_byte_data)
         elif route == "proxy" and self._using_proxy:
-            self._handle_via_proxy(conn, target_host, target_port, thread_id)
+            self._handle_via_proxy(conn, target_host, target_port, thread_id, first_byte_data)
         elif self.should_bypass(target_host):
             self.direct.handle(conn, target_host, target_port, thread_id)
         else:
-            self._handle_tunnel(conn, target_host, target_port, thread_id)
+            self._handle_tunnel(conn, target_host, target_port, thread_id, first_byte_data)
     
-    def _handle_direct(self, local_conn, target_host, target_port, thread_id):
+    def _handle_direct(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         remote = None
         try:
             local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
             remote = socket.create_connection((target_host, target_port), timeout=10)
+            # Send the first byte we already read
+            if first_byte:
+                remote.sendall(first_byte)
             remote.setblocking(False)
             local_conn.setblocking(False)
             while self.running:
@@ -224,7 +250,7 @@ class SocksToHttpTunnel:
                 except:
                     pass
     
-    def _handle_via_proxy(self, local_conn, target_host, target_port, thread_id):
+    def _handle_via_proxy(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         remote = None
         try:
             local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
@@ -232,13 +258,15 @@ class SocksToHttpTunnel:
             proxy_host = proxy_url.split("://")[1].split(":")[0] if "://" in proxy_url else proxy_url.split(":")[0]
             proxy_port = int(proxy_url.split(":")[-1]) if ":" in proxy_url.split("://")[-1] else 8080
             remote = socket.create_connection((proxy_host, proxy_port), timeout=10)
-            # HTTP CONNECT for non-HTTP protocols
             connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
             remote.sendall(connect_req.encode())
             resp = remote.recv(4096)
             if b"200" not in resp:
                 self.logger.error(f"[{thread_id}] Proxy CONNECT failed")
                 return
+            # Send the first byte after CONNECT
+            if first_byte:
+                remote.sendall(first_byte)
             remote.setblocking(False)
             local_conn.setblocking(False)
             while self.running:
@@ -272,7 +300,7 @@ class SocksToHttpTunnel:
                 except:
                     pass
     
-    def _handle_tunnel(self, local_conn, target_host, target_port, thread_id):
+    def _handle_tunnel(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         session_id = None
         try:
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
@@ -286,7 +314,8 @@ class SocksToHttpTunnel:
             local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
             self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
             local_conn.setblocking(False)
-            buf = b""
+            # Include first byte in buffer
+            buf = first_byte if first_byte else b""
             last = time.time()
             hb = self.heartbeat_interval
             bw = 0 if self._using_proxy else (self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0)
