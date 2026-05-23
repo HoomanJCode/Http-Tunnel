@@ -1,4 +1,4 @@
-"""HTTP tunnel client - raw TCP passthrough with three routing modes."""
+"""HTTP tunnel client - protocol-aware routing."""
 
 import socket
 import time
@@ -24,8 +24,31 @@ from http_tunnel.client.direct import DirectConnector
 from http_tunnel.client.udp import UdpRelay
 
 
+def detect_protocol(first_bytes: bytes) -> str:
+    """Detect protocol from first bytes of connection.
+    
+    Returns: 'tls', 'http', 'socks5', 'ssh', 'mtproto', 'unknown'
+    """
+    if not first_bytes:
+        return 'unknown'
+    b = first_bytes[0]
+    if b == 0x16 or b == 0x17:
+        return 'tls'
+    if b == 0x05:
+        return 'socks5'
+    if b == 0xef:
+        return 'mtproto'
+    if first_bytes.startswith(b'GET ') or first_bytes.startswith(b'POST ') or \
+       first_bytes.startswith(b'HEAD ') or first_bytes.startswith(b'PUT ') or \
+       first_bytes.startswith(b'DELETE ') or first_bytes.startswith(b'CONNECT '):
+        return 'http'
+    if first_bytes.startswith(b'SSH-'):
+        return 'ssh'
+    return 'unknown'
+
+
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with three routing modes per port."""
+    """Bridges SOCKS5 to HTTP tunnel with protocol-based routing."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -46,9 +69,10 @@ class SocksToHttpTunnel:
         self.max_bytes = self.config["max_post_bytes"]
         self.bypass_local = self.config["bypass_local"]
         self._setup_bypass_networks()
-        # Routing modes
+        # Protocol-based routing
+        self.route_tls = self.config.get("route_tls", "tunnel")
         self.route_http = self.config.get("route_http", "tunnel")
-        self.route_https = self.config.get("route_https", "tunnel")
+        self.route_other = self.config.get("route_other", "tunnel")
         self.high_priority_ports = self.config.get("high_priority_ports", [22, 80, 443, 8080])
         socks_addr = self.config["socks_listen"].split(":")
         self.socks_host = socks_addr[0]
@@ -77,8 +101,9 @@ class SocksToHttpTunnel:
     
     def _setup_http_session(self):
         self._session = requests.Session()
-        pool_hosts = 4 if self._using_proxy else 50
-        pool_max = 8 if self._using_proxy else 100
+        # Larger pool for relay proxy to handle browser concurrency
+        pool_hosts = 10 if self._using_proxy else 50
+        pool_max = 20 if self._using_proxy else 100
         adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
         self._session.mount('http://', adapter)
         self._session.mount('https://', adapter)
@@ -101,13 +126,13 @@ class SocksToHttpTunnel:
                     continue
                 raise
     
-    def _get_route(self, target_port: int) -> str:
-        """Get routing mode for a port."""
-        if target_port == 80:
+    def _get_route_for_protocol(self, proto: str) -> str:
+        """Get routing mode based on detected protocol."""
+        if proto == 'tls':
+            return self.route_tls
+        elif proto == 'http':
             return self.route_http
-        elif target_port == 443:
-            return self.route_https
-        return "tunnel"
+        return self.route_other
     
     def should_bypass(self, host: str) -> bool:
         if self.bypass_local and host in ["127.0.0.1", "localhost", "::1"]:
@@ -124,28 +149,38 @@ class SocksToHttpTunnel:
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
         
-        if cmd == 1:
-            route = self._get_route(target_port)
-            
-            if route == "direct":
-                self.logger.info(f"[{thread_id}] Direct: {target_host}:{target_port}")
-                self._handle_direct(conn, target_host, target_port, thread_id)
-                return
-            elif route == "proxy" and self._using_proxy:
-                self.logger.info(f"[{thread_id}] Proxy: {target_host}:{target_port}")
-                self._handle_via_proxy(conn, target_host, target_port, thread_id)
-                return
-            elif self.should_bypass(target_host):
-                self.direct.handle(conn, target_host, target_port, thread_id)
-                return
+        if cmd != 1:
+            if cmd == 3:
+                self.udp.handle(conn, target_host, target_port, thread_id)
+            return
         
-        if cmd == 1:
+        # Peek at first bytes to detect protocol
+        conn.setblocking(True)
+        conn.settimeout(3)
+        try:
+            first_bytes = conn.recv(4096, socket.MSG_PEEK)
+        except socket.timeout:
+            first_bytes = b""
+        except:
+            first_bytes = b""
+        conn.setblocking(True)
+        conn.settimeout(10)
+        
+        proto = detect_protocol(first_bytes)
+        route = self._get_route_for_protocol(proto)
+        
+        self.logger.info(f"[{thread_id}] {proto}:{target_port} -> {route} ({target_host}:{target_port})")
+        
+        if route == "direct":
+            self._handle_direct(conn, target_host, target_port, thread_id)
+        elif route == "proxy" and self._using_proxy:
+            self._handle_via_proxy(conn, target_host, target_port, thread_id)
+        elif self.should_bypass(target_host):
+            self.direct.handle(conn, target_host, target_port, thread_id)
+        else:
             self._handle_tunnel(conn, target_host, target_port, thread_id)
-        elif cmd == 3:
-            self.udp.handle(conn, target_host, target_port, thread_id)
     
     def _handle_direct(self, local_conn, target_host, target_port, thread_id):
-        """Connect directly to target without proxy or tunnel."""
         remote = None
         try:
             local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
@@ -184,27 +219,20 @@ class SocksToHttpTunnel:
                     pass
     
     def _handle_via_proxy(self, local_conn, target_host, target_port, thread_id):
-        """Connect through outbound proxy (HTTP CONNECT)."""
         remote = None
         try:
             local_conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
-            
             proxy_url = self.config["outbound_http_proxy"]
             proxy_host = proxy_url.split("://")[1].split(":")[0] if "://" in proxy_url else proxy_url.split(":")[0]
             proxy_port = int(proxy_url.split(":")[-1]) if ":" in proxy_url.split("://")[-1] else 8080
-            
             remote = socket.create_connection((proxy_host, proxy_port), timeout=10)
-            
-            # HTTP CONNECT for HTTPS
-            if target_port == 443:
-                connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
-                remote.sendall(connect_req.encode())
-                resp = remote.recv(4096)
-                if b"200" not in resp:
-                    self.logger.error(f"[{thread_id}] Proxy CONNECT failed")
-                    return
-                self.logger.info(f"[{thread_id}] Proxy CONNECT -> {target_host}:{target_port}")
-            
+            # HTTP CONNECT for non-HTTP protocols
+            connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+            remote.sendall(connect_req.encode())
+            resp = remote.recv(4096)
+            if b"200" not in resp:
+                self.logger.error(f"[{thread_id}] Proxy CONNECT failed")
+                return
             remote.setblocking(False)
             local_conn.setblocking(False)
             while self.running:
@@ -314,7 +342,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"HTTP(80): {self.route_http} | HTTPS(443): {self.route_https} | Other: tunnel")
+        self.logger.info(f"TLS: {self.route_tls} | HTTP: {self.route_http} | Other: {self.route_other}")
         self.logger.info(f"DNS: {self.dns_mode}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
