@@ -39,23 +39,18 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         client = self.client_address[0]
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            
             if content_length > self.max_post_bytes:
                 self.send_error(413)
                 return
-            
             try:
                 body = self.rfile.read(content_length).decode()
             except (ConnectionResetError, BrokenPipeError, OSError):
                 return
-            
             try:
                 plain = self.crypto.decrypt(body)
             except Exception:
                 self.send_error(400)
                 return
-            
-            # Control messages
             try:
                 msg = json.loads(plain.decode())
                 if msg.get("type") == "ping":
@@ -67,13 +62,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     return
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
-            
-            # Session data: session_id::data
             if b'::' in plain:
                 parts = plain.split(b'::', 1)
                 session_id = parts[0].decode('ascii', errors='ignore')
                 message = parts[1] if len(parts) > 1 else b""
-                
                 session = self.sessions.get(session_id)
                 if session:
                     if message.startswith(b"UDP:"):
@@ -82,7 +74,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         self._handle_tcp(client, session, message)
                 else:
                     self._send(b"invalid_session")
-                
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         except Exception as e:
@@ -92,11 +83,9 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         host = msg.get("host")
         port = msg.get("port")
         proto = msg.get("proto", PROTO_TCP)
-        
         if not host or not port:
             self._send(json.dumps({"status": "error"}).encode())
             return
-        
         try:
             if proto == PROTO_UDP:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -105,59 +94,72 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 sock = self._connect(host, port)
                 sock.setblocking(False)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
-            
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
-            
         except Exception as e:
             self.logger.error(f"Connect failed {host}:{port}: {e}")
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
     
     def _connect(self, host: str, port: int) -> socket.socket:
-        """Connect to host:port with DNS resolution."""
-        # Try raw IP
-        for family in [socket.AF_INET, socket.AF_INET6]:
-            try:
-                socket.inet_pton(family, host)
-                return socket.create_connection((host, port), timeout=10)
-            except (socket.error, OSError):
-                continue
+        """Connect to host:port. Tries IPv4 first, then hostname resolution.
+        Only tries IPv6 if the server has IPv6 connectivity."""
         
-        # DNS resolution (IPv4 first)
-        addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # If it's a hostname, resolve it (getaddrinfo handles IPv4/IPv6 preference)
+        try:
+            socket.inet_pton(socket.AF_INET, host)
+            # It's an IPv4 address - connect directly
+            return socket.create_connection((host, port), timeout=10)
+        except socket.error:
+            pass
+        
+        try:
+            socket.inet_pton(socket.AF_INET6, host)
+            # It's an IPv6 address - try it but fail fast if no IPv6
+            try:
+                sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((host, port))
+                return sock
+            except OSError as e:
+                raise OSError(f"IPv6 not available: {e}")
+        except socket.error:
+            pass
+        
+        # Hostname - resolve with IPv4 preference
+        try:
+            addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except socket.gaierror:
+            raise OSError(f"DNS resolution failed for {host}")
+        
+        # Sort: IPv4 first
         addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
         
+        last_error = None
         for family, socktype, proto, canonname, sockaddr in addrs:
             try:
                 sock = socket.socket(family, socktype, proto)
                 sock.settimeout(10)
                 sock.connect(sockaddr)
                 return sock
-            except OSError:
+            except OSError as e:
+                last_error = e
                 continue
         
-        raise OSError(f"Could not connect to {host}:{port}")
+        raise OSError(f"Could not connect to {host}:{port}: {last_error}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """Handle TCP data relay."""
         session.touch()
-        
         if message == MSG_CLOSE:
             self.logger.info(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
             self._send(b"closed")
             return
-        
-        # Decompress
         if message and message != MSG_HEARTBEAT and self.compression:
             try:
                 message = decompress_data(message)
             except:
                 pass
-        
-        # Forward to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -166,8 +168,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self.sessions.remove(session.id)
                 self._send(b"destination_closed")
                 return
-        
-        # Read response
         response = b""
         try:
             while True:
@@ -187,27 +187,21 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except:
             self.sessions.remove(session.id)
             response = b"destination_closed"
-        
-        # Compress
         if response and response != b"destination_closed" and self.compression:
             try:
                 response = compress_data(response, COMPRESS_ZLIB, 100)
             except:
                 pass
-        
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
-        """Handle UDP data relay."""
         session.touch()
-        
         if data and data not in [MSG_CLOSE, MSG_HEARTBEAT]:
             try:
                 session.socket.sendto(data, (session.host, session.port))
                 session.record_sent(len(data))
             except:
                 pass
-        
         response = b""
         try:
             ready = select.select([session.socket], [], [], 0.001)
@@ -216,11 +210,9 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 response = data
         except:
             pass
-        
         self._send(response if response else b"")
     
     def _send(self, data: bytes):
-        """Send encrypted response."""
         try:
             token = self.crypto.encrypt(data)
             self.send_response(200)
@@ -234,4 +226,4 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             pass
     
     def log_message(self, format, *args):
-        pass  # Suppress default logging
+        pass

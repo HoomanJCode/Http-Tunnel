@@ -114,6 +114,11 @@ class SocksToHttpTunnel:
     
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
+        
+        # Warn if IPv6 address received (application resolved DNS locally)
+        if atyp == 4 and self.dns_mode == "server":
+            self.logger.debug(f"[{thread_id}] IPv6 address - may fail if server has no IPv6")
+        
         if cmd == 1 and self.should_bypass(target_host):
             self.direct.handle(conn, target_host, target_port, thread_id)
         elif cmd == 1:
@@ -129,7 +134,12 @@ class SocksToHttpTunnel:
             resp = self.http_post(enc_connect, f"{thread_id}-connect")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             if resp_data.get("status") != "ok":
-                self.logger.error(f"[{thread_id}] Server refused: {resp_data.get('reason')}")
+                reason = resp_data.get('reason', 'Unknown')
+                # Suppress log spam for expected failures
+                if 'Network is unreachable' in reason or 'IPv6' in reason:
+                    self.logger.debug(f"[{thread_id}] Server cannot reach {target_host}:{target_port}")
+                else:
+                    self.logger.error(f"[{thread_id}] Server refused: {reason}")
                 local_conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
             session_id = resp_data["session"]
