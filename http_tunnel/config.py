@@ -20,27 +20,66 @@ SERVER_CONFIG_PARAMS = {
     "encryption_key": _REQUIRED,   # Must be provided
     "listen": _REQUIRED,           # Must be provided
     "max_post_bytes": 5242880,     # 5MB default
-    "tcp_timeout": 60,             # Session idle timeout
-    "udp_timeout": 120,            # UDP session timeout
+    "tcp_timeout": 60,             # Session idle timeout in seconds
+    "udp_timeout": 120,            # UDP session timeout in seconds
     "cleanup_interval": 30,        # Stale session check interval
     "compression": True,           # Zlib compression enabled
+    "compress_threshold": 100,     # Minimum bytes to attempt compression
+    "tcp_nodelay": True,           # Disable Nagle's algorithm for lower latency
     "log_level": "INFO"            # Logging verbosity
 }
 
 # Valid client configuration parameters with defaults
 CLIENT_CONFIG_PARAMS = {
+    # Required
     "encryption_key": _REQUIRED,   # Must match server
     "socks_listen": _REQUIRED,     # SOCKS5 proxy address
     "server_url": _REQUIRED,       # Tunnel server URL
-    "outbound_http_proxy": "",     # Optional outbound proxy
-    "max_post_bytes": 5242880,     # 5MB default
-    "http_timeout": 30,            # HTTP request timeout
-    "heartbeat_interval": 1,       # Keep-alive interval (adaptive)
-    "batch_wait": 0.01,            # Data batching delay
-    "reconnect_delay": 0.5,        # Reconnection backoff base
-    "compression": True,           # Zlib compression enabled
-    "bypass_local": True,          # Bypass tunnel for localhost
+    
+    # Proxy
+    "outbound_http_proxy": "",     # Optional outbound proxy URL
+    
+    # DNS
     "dns_mode": "server",          # DNS resolution: server or local
+    
+    # Connection limits
+    "max_concurrent_requests": 15, # Max simultaneous HTTP requests (0=unlimited)
+    "max_socks_connections": 100,  # Max SOCKS5 connections (0=unlimited)
+    "connection_pool_hosts": 10,   # HTTP pool: max different hosts
+    "connection_pool_max": 15,     # HTTP pool: max connections per host
+    
+    # Timing
+    "http_timeout": 30,            # HTTP request timeout in seconds
+    "heartbeat_interval": 1,       # Keep-alive interval (adaptive min)
+    "heartbeat_max": 30,           # Keep-alive max after backoff
+    "batch_wait": 0.01,            # Data batching delay (0=disable batching)
+    "reconnect_delay": 0.5,        # Reconnection backoff base
+    
+    # Size limits
+    "max_post_bytes": 5242880,     # 5MB default
+    
+    # Compression
+    "compression": True,           # Zlib compression enabled
+    "compress_threshold": 100,     # Minimum bytes to attempt compression
+    "skip_compress_tls": True,     # Don't compress already-encrypted TLS data
+    
+    # Retry
+    "max_retries": 5,              # Max retries on proxy errors (502)
+    "retry_backoff": 2.0,          # Backoff multiplier for retries
+    
+    # Bypass
+    "bypass_local": True,          # Bypass tunnel for localhost
+    "bypass_ranges": [             # IP ranges to bypass (CIDR notation)
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16"
+    ],
+    
+    # QoS
+    "high_priority_ports": [22, 80, 443, 8080],  # Ports with lower batch wait
+    
+    # Logging
     "log_level": "INFO"            # Logging verbosity
 }
 
@@ -132,6 +171,12 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
+    if config["compression"]:
+        _prompt_int(config, "compress_threshold", "Compression threshold (bytes)", 100)
+    
+    tcp_nodelay = input("Enable TCP_NODELAY? (Y/n) [Y]: ").strip().lower()
+    config["tcp_nodelay"] = tcp_nodelay != 'n'
+    
     # Logging
     print("\n--- Logging ---")
     log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
@@ -177,27 +222,63 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     outbound_proxy = input("Outbound HTTP proxy (leave empty for none): ").strip()
     config["outbound_http_proxy"] = outbound_proxy if outbound_proxy else ""
     
-    # DNS mode (important for censorship bypass)
+    # DNS mode
     print("\n--- DNS Configuration ---")
     print("'server' mode prevents DNS leaks by resolving on server")
     dns_mode = input("DNS resolution mode (local/server) [server]: ").strip().lower()
     config["dns_mode"] = dns_mode if dns_mode in ["local", "server"] else "server"
     
-    # Performance
-    print("\n--- Performance (press Enter for defaults) ---")
-    _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
+    # Connection limits
+    print("\n--- Connection Limits (0 = unlimited) ---")
+    _prompt_int(config, "max_concurrent_requests", "Max concurrent HTTP requests", 15)
+    _prompt_int(config, "max_socks_connections", "Max SOCKS5 connections", 100)
+    _prompt_int(config, "connection_pool_hosts", "HTTP pool max hosts", 10)
+    _prompt_int(config, "connection_pool_max", "HTTP pool max per host", 15)
+    
+    # Timing
+    print("\n--- Timing (press Enter for defaults) ---")
     _prompt_float(config, "http_timeout", "HTTP request timeout (seconds)", 30)
     _prompt_float(config, "heartbeat_interval", "Heartbeat interval (seconds)", 1)
-    _prompt_float(config, "batch_wait", "Batch wait time (seconds)", 0.01)
+    _prompt_float(config, "heartbeat_max", "Max heartbeat after backoff (seconds)", 30)
+    _prompt_float(config, "batch_wait", "Batch wait (seconds, 0=disable)", 0.01)
     _prompt_float(config, "reconnect_delay", "Reconnect delay (seconds)", 0.5)
     
+    # Size limits
+    _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
+    
+    # Compression
+    print("\n--- Compression ---")
     compress = input("Enable compression? (Y/n) [Y]: ").strip().lower()
     config["compression"] = compress != 'n'
     
+    if config["compression"]:
+        _prompt_int(config, "compress_threshold", "Compression threshold (bytes)", 100)
+        skip_tls = input("Skip compression for TLS data? (Y/n) [Y]: ").strip().lower()
+        config["skip_compress_tls"] = skip_tls != 'n'
+    
+    # Retry
+    print("\n--- Retry ---")
+    _prompt_int(config, "max_retries", "Max retries on errors", 5)
+    _prompt_float(config, "retry_backoff", "Retry backoff multiplier", 2.0)
+    
     # Bypass
     print("\n--- Bypass ---")
-    bypass_local = input("Bypass localhost requests? (Y/n) [Y]: ").strip().lower()
+    bypass_local = input("Bypass localhost? (Y/n) [Y]: ").strip().lower()
     config["bypass_local"] = bypass_local != 'n'
+    
+    bypass_input = input("Bypass IP ranges (comma-separated CIDR, Enter for defaults): ").strip()
+    if bypass_input:
+        config["bypass_ranges"] = [r.strip() for r in bypass_input.split(",")]
+    else:
+        config["bypass_ranges"] = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    
+    # QoS
+    print("\n--- QoS ---")
+    qos_input = input("High priority ports (comma-separated, Enter for defaults): ").strip()
+    if qos_input:
+        config["high_priority_ports"] = [int(p.strip()) for p in qos_input.split(",")]
+    else:
+        config["high_priority_ports"] = [22, 80, 443, 8080]
     
     # Logging
     print("\n--- Logging ---")
