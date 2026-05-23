@@ -149,6 +149,12 @@ class SocksToHttpTunnel:
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
         
+        # Reject IPv6 when server has no IPv6 connectivity
+        if atyp == 4:
+            self.logger.debug(f"[{thread_id}] IPv6 rejected: {target_host} (server has no IPv6)")
+            conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # Host unreachable
+            return
+        
         if cmd != 1:
             if cmd == 3:
                 self.udp.handle(conn, target_host, target_port, thread_id)
