@@ -4,6 +4,7 @@ import json
 import socket
 import time
 import select
+import struct
 from http.server import BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 
@@ -141,8 +142,85 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         
         raise OSError(f"Could not connect to {host}:{port}: {last_error}")
     
+    def _read_tls_record(self, sock) -> bytes:
+        """Read a complete TLS record from socket.
+        
+        TLS records have a 5-byte header:
+        - Byte 0: Content type (0x16=Handshake, 0x17=App data)
+        - Bytes 1-2: TLS version
+        - Bytes 3-4: Record length (big-endian)
+        
+        Returns the complete TLS record or empty bytes on error/timeout.
+        """
+        try:
+            # Try to read the 5-byte TLS header
+            ready = select.select([sock], [], [], 0.05)
+            if not ready[0]:
+                return None  # No data yet
+            
+            # Peek at first byte to check if it's TLS
+            first_byte = sock.recv(1, socket.MSG_PEEK)
+            if not first_byte:
+                return b""
+            
+            # If it's not TLS, just read whatever is available
+            if first_byte[0] not in [0x16, 0x17, 0x14, 0x15, 0x18]:
+                data = b""
+                while True:
+                    ready = select.select([sock], [], [], 0.01)
+                    if ready[0]:
+                        try:
+                            chunk = sock.recv(65536)
+                            if not chunk:
+                                break
+                            data += chunk
+                        except BlockingIOError:
+                            break
+                    else:
+                        break
+                return data if data else None
+            
+            # Read the full 5-byte header
+            header = b""
+            while len(header) < 5:
+                ready = select.select([sock], [], [], 0.5)
+                if not ready[0]:
+                    return None
+                try:
+                    chunk = sock.recv(5 - len(header))
+                    if not chunk:
+                        return b""
+                    header += chunk
+                except BlockingIOError:
+                    continue
+            
+            # Parse record length from bytes 3-4
+            record_length = struct.unpack('!H', header[3:5])[0]
+            total_length = 5 + record_length
+            
+            # Read the rest of the record
+            data = header
+            while len(data) < total_length:
+                remaining = total_length - len(data)
+                ready = select.select([sock], [], [], 0.5)
+                if not ready[0]:
+                    # Timeout - return what we have so far
+                    break
+                try:
+                    chunk = sock.recv(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    data += chunk
+                except BlockingIOError:
+                    continue
+            
+            return data
+            
+        except Exception:
+            return None
+    
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """Handle TCP data relay - server never compresses response data."""
+        """Handle TCP data relay with TLS record reassembly."""
         session.touch()
         
         if message == MSG_CLOSE:
@@ -151,7 +229,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(b"closed")
             return
         
-        # Decompress incoming data from client (client may have compressed it)
+        # Decompress incoming data from client
         if message and message != MSG_HEARTBEAT:
             try:
                 message = decompress_data(message)
@@ -168,36 +246,25 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self._send(b"destination_closed")
                 return
         
-        # Read response from destination
+        # Read response - try to get complete TLS record
         response = b""
         try:
-            while True:
-                ready = select.select([session.socket], [], [], 0.01)
-                if ready[0]:
-                    try:
-                        chunk = session.socket.recv(65536)
-                        if not chunk:
-                            self.sessions.remove(session.id)
-                            response = b"destination_closed"
-                            break
-                        response += chunk
-                        session.record_received(len(chunk))
-                        if len(response) >= self.max_post_bytes - 2000:
-                            break
-                    except BlockingIOError:
-                        break
-                    except (ConnectionResetError, BrokenPipeError):
-                        self.sessions.remove(session.id)
-                        response = b"destination_closed"
-                        break
+            # Try TLS-aware read first
+            tls_data = self._read_tls_record(session.socket)
+            if tls_data is not None:
+                if tls_data == b"":
+                    self.sessions.remove(session.id)
+                    response = b"destination_closed"
                 else:
-                    break
+                    response = tls_data
+                    session.record_received(len(tls_data))
+            elif response == b"":
+                # No data available, send empty response (heartbeat will follow)
+                pass
         except:
             self.sessions.remove(session.id)
             response = b"destination_closed"
         
-        # Send response as-is without compression
-        # Client handles all compression decisions
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
