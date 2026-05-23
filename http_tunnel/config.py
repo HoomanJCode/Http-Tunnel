@@ -12,6 +12,7 @@ SERVER_CONFIG_PARAMS = {
     "max_post_bytes": 5242880,
     "tcp_timeout": 60,
     "udp_timeout": 120,
+    "connect_timeout": 8,
     "cleanup_interval": 30,
     "log_level": "INFO"
 }
@@ -23,6 +24,7 @@ CLIENT_CONFIG_PARAMS = {
     "outbound_http_proxy": "",
     "dns_mode": "server",
     "http_timeout": 45,
+    "connect_timeout": 8,
     "heartbeat_interval": 1,
     "batch_wait": 0.01,
     "reconnect_delay": 0.5,
@@ -72,8 +74,7 @@ def load_and_clean_config(config_path: str, config_type: str = "client") -> dict
 
 def generate_server_config(config_path: str = "server_config.json") -> bool:
     if os.path.exists(config_path):
-        overwrite = input(f"Config {config_path} exists. Overwrite? (y/N): ").lower()
-        if overwrite != 'y':
+        if input(f"Config {config_path} exists. Overwrite? (y/N): ").lower() != 'y':
             return False
     config = {}
     print("\n=== Server Configuration ===\n")
@@ -84,16 +85,15 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
         print(f"Generated: {psk}")
     config["encryption_key"] = psk
     print("\nNetwork:")
-    listen_addr = input("Listen address [0.0.0.0:8080]: ").strip()
-    config["listen"] = listen_addr if listen_addr else "0.0.0.0:8080"
-    print("\nPerformance (Enter for defaults):")
+    config["listen"] = input("Listen address [0.0.0.0:8080]: ").strip() or "0.0.0.0:8080"
+    print("\nTimeouts (Enter for defaults):")
+    _prompt_float(config, "connect_timeout", "TCP connect timeout (s)", 8)
+    _prompt_float(config, "tcp_timeout", "TCP idle timeout (s)", 60)
+    _prompt_float(config, "udp_timeout", "UDP idle timeout (s)", 120)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
-    _prompt_float(config, "tcp_timeout", "TCP timeout (s)", 60)
-    _prompt_float(config, "udp_timeout", "UDP timeout (s)", 120)
     _prompt_float(config, "cleanup_interval", "Cleanup interval (s)", 30)
     print("\nLogging:")
-    log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
-    config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
+    config["log_level"] = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper() or "INFO"
     config = clean_config(config, "server")
     save_config(config_path, config)
     print(f"\nSaved: {config_path}")
@@ -102,8 +102,7 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
 
 def generate_client_config(config_path: str = "client_config.json") -> bool:
     if os.path.exists(config_path):
-        overwrite = input(f"Config {config_path} exists. Overwrite? (y/N): ").lower()
-        if overwrite != 'y':
+        if input(f"Config {config_path} exists. Overwrite? (y/N): ").lower() != 'y':
             return False
     config = {}
     print("\n=== Client Configuration ===\n")
@@ -113,40 +112,29 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
         psk = secrets.token_hex(16)
         print(f"Generated: {psk}")
     config["encryption_key"] = psk
-    print("\nSOCKS5 Proxy:")
-    socks_addr = input("Listen address [127.0.0.1:1080]: ").strip()
-    config["socks_listen"] = socks_addr if socks_addr else "127.0.0.1:1080"
+    print("\nSOCKS5:")
+    config["socks_listen"] = input("Listen address [127.0.0.1:1080]: ").strip() or "127.0.0.1:1080"
     print("\nServer:")
-    server_url = input("Server URL [http://localhost:8080/tunnel]: ").strip()
-    config["server_url"] = server_url if server_url else "http://localhost:8080/tunnel"
-    outbound_proxy = input("Outbound proxy (empty=none): ").strip()
-    config["outbound_http_proxy"] = outbound_proxy if outbound_proxy else ""
+    config["server_url"] = input("Server URL [http://localhost:8080/tunnel]: ").strip() or "http://localhost:8080/tunnel"
+    config["outbound_http_proxy"] = input("Outbound proxy (empty=none): ").strip()
     print("\nDNS (server=no leaks):")
-    dns_mode = input("DNS mode (local/server) [server]: ").strip().lower()
-    config["dns_mode"] = dns_mode if dns_mode in ["local", "server"] else "server"
-    print("\nTiming (Enter for defaults):")
+    config["dns_mode"] = input("DNS mode (local/server) [server]: ").strip().lower() or "server"
+    print("\nTimeouts (Enter for defaults):")
+    _prompt_float(config, "connect_timeout", "TCP connect timeout (s)", 8)
     _prompt_float(config, "http_timeout", "HTTP timeout (s)", 45)
     _prompt_float(config, "heartbeat_interval", "Heartbeat (s)", 1)
     _prompt_float(config, "batch_wait", "Batch wait (s, 0=instant)", 0.01)
     _prompt_float(config, "reconnect_delay", "Reconnect delay (s)", 0.5)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
     print("\nBypass:")
-    bypass_local = input("Bypass localhost? (Y/n) [Y]: ").strip().lower()
-    config["bypass_local"] = bypass_local != 'n'
+    config["bypass_local"] = input("Bypass localhost? (Y/n) [Y]: ").strip().lower() != 'n'
     bypass_input = input("Bypass CIDRs (comma, Enter=defaults): ").strip()
-    if bypass_input:
-        config["bypass_ranges"] = [r.strip() for r in bypass_input.split(",")]
-    else:
-        config["bypass_ranges"] = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    config["bypass_ranges"] = [r.strip() for r in bypass_input.split(",")] if bypass_input else ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
     print("\nQoS (lower batch wait for these ports):")
     qos_input = input("Priority ports (comma, Enter=defaults): ").strip()
-    if qos_input:
-        config["high_priority_ports"] = [int(p.strip()) for p in qos_input.split(",")]
-    else:
-        config["high_priority_ports"] = [22, 80, 443, 8080]
+    config["high_priority_ports"] = [int(p.strip()) for p in qos_input.split(",")] if qos_input else [22, 80, 443, 8080]
     print("\nLogging:")
-    log_level = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper()
-    config["log_level"] = log_level if log_level in ["DEBUG", "INFO", "WARNING", "ERROR"] else "INFO"
+    config["log_level"] = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper() or "INFO"
     config = clean_config(config, "client")
     save_config(config_path, config)
     print(f"\nSaved: {config_path}")

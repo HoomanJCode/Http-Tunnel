@@ -13,16 +13,13 @@ from http_tunnel.server.session import Session, SessionManager
 
 
 class TunnelRequestHandler(BaseHTTPRequestHandler):
-    """Handles HTTP POST requests for tunnel data relay.
-    
-    Raw passthrough: data flows unmodified.
-    Only encryption/decryption for transport security.
-    """
+    """Handles HTTP POST requests for tunnel data relay."""
     
     crypto: TunnelCrypto = None
     max_post_bytes: int = 5242880
     tcp_timeout: int = 60
     udp_timeout: int = 120
+    connect_timeout: int = 8
     logger = None
     
     sessions = SessionManager()
@@ -104,21 +101,22 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
     
     def _connect(self, host: str, port: int) -> socket.socket:
+        ct = self.connect_timeout
         try:
             socket.inet_pton(socket.AF_INET, host)
-            return socket.create_connection((host, port), timeout=10)
-        except socket.error:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(ct)
+            sock.connect((host, port))
+            return sock
+        except (socket.error, OSError):
             pass
         try:
             socket.inet_pton(socket.AF_INET6, host)
-            try:
-                sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                sock.connect((host, port))
-                return sock
-            except OSError as e:
-                raise OSError(f"IPv6 not available: {e}")
-        except socket.error:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.settimeout(min(ct, 5))
+            sock.connect((host, port))
+            return sock
+        except (socket.error, OSError):
             pass
         try:
             addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -128,7 +126,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         for family, socktype, proto, canonname, sockaddr in addrs:
             try:
                 sock = socket.socket(family, socktype, proto)
-                sock.settimeout(10)
+                sock.settimeout(ct)
                 sock.connect(sockaddr)
                 return sock
             except OSError:
@@ -137,14 +135,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
         session.touch()
-        
         if message == MSG_CLOSE:
             self.logger.info(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
             self._send(b"closed")
             return
-        
-        # Forward raw to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -153,8 +148,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self.sessions.remove(session.id)
                 self._send(b"destination_closed")
                 return
-        
-        # Read raw response
         response = b""
         try:
             deadline = time.time() + 0.5
@@ -183,7 +176,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except:
             self.sessions.remove(session.id)
             response = b"destination_closed"
-        
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
