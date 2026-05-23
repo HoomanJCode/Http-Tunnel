@@ -102,20 +102,15 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
     
     def _connect(self, host: str, port: int) -> socket.socket:
-        """Connect to host:port. Tries IPv4 first, then hostname resolution.
-        Only tries IPv6 if the server has IPv6 connectivity."""
-        
-        # If it's a hostname, resolve it (getaddrinfo handles IPv4/IPv6 preference)
+        """Connect to host:port. Tries IPv4 first, then hostname resolution."""
         try:
             socket.inet_pton(socket.AF_INET, host)
-            # It's an IPv4 address - connect directly
             return socket.create_connection((host, port), timeout=10)
         except socket.error:
             pass
         
         try:
             socket.inet_pton(socket.AF_INET6, host)
-            # It's an IPv6 address - try it but fail fast if no IPv6
             try:
                 sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
                 sock.settimeout(5)
@@ -126,13 +121,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except socket.error:
             pass
         
-        # Hostname - resolve with IPv4 preference
         try:
             addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except socket.gaierror:
             raise OSError(f"DNS resolution failed for {host}")
         
-        # Sort: IPv4 first
         addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
         
         last_error = None
@@ -149,17 +142,23 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         raise OSError(f"Could not connect to {host}:{port}: {last_error}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
+        """Handle TCP data relay - server never compresses response data."""
         session.touch()
+        
         if message == MSG_CLOSE:
             self.logger.info(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
             self._send(b"closed")
             return
-        if message and message != MSG_HEARTBEAT and self.compression:
+        
+        # Decompress incoming data from client (client may have compressed it)
+        if message and message != MSG_HEARTBEAT:
             try:
                 message = decompress_data(message)
             except:
                 pass
+        
+        # Forward to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -168,30 +167,37 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self.sessions.remove(session.id)
                 self._send(b"destination_closed")
                 return
+        
+        # Read response from destination
         response = b""
         try:
             while True:
                 ready = select.select([session.socket], [], [], 0.01)
                 if ready[0]:
-                    chunk = session.socket.recv(65536)
-                    if not chunk:
+                    try:
+                        chunk = session.socket.recv(65536)
+                        if not chunk:
+                            self.sessions.remove(session.id)
+                            response = b"destination_closed"
+                            break
+                        response += chunk
+                        session.record_received(len(chunk))
+                        if len(response) >= self.max_post_bytes - 2000:
+                            break
+                    except BlockingIOError:
+                        break
+                    except (ConnectionResetError, BrokenPipeError):
                         self.sessions.remove(session.id)
                         response = b"destination_closed"
-                        break
-                    response += chunk
-                    session.record_received(len(chunk))
-                    if len(response) >= self.max_post_bytes - 2000:
                         break
                 else:
                     break
         except:
             self.sessions.remove(session.id)
             response = b"destination_closed"
-        if response and response != b"destination_closed" and self.compression:
-            try:
-                response = compress_data(response, COMPRESS_ZLIB, 100)
-            except:
-                pass
+        
+        # Send response as-is without compression
+        # Client handles all compression decisions
         self._send(response if response else b"")
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
