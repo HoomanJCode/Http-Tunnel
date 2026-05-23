@@ -168,11 +168,14 @@ class SocksToHttpTunnel:
         """Route SOCKS5 connection to appropriate handler."""
         thread_id = threading.current_thread().name
         
-        if cmd == 1 and self.should_bypass(target_host):
-            self.direct.handle(conn, target_host, target_port, thread_id)
-        elif cmd == 1:
-            self._handle_tcp_connect(conn, target_host, target_port, thread_id)
-        elif cmd == 3:
+        if cmd == 1:  # TCP CONNECT
+            if self.should_bypass(target_host):
+                self.direct.handle(conn, target_host, target_port, thread_id)
+            else:
+                self._handle_tcp_connect(conn, target_host, target_port, thread_id)
+        elif cmd == 3:  # UDP ASSOCIATE
+            # For UDP ASSOCIATE, the address/port is the client's address
+            # We need to create a local UDP relay
             self.udp.handle(conn, target_host, target_port, thread_id)
     
     def _handle_tcp_connect(self, local_conn: socket.socket, target_host: str,
