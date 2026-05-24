@@ -1,4 +1,4 @@
-"""HTTP request handler for tunnel server - raw TCP passthrough."""
+"""HTTP request handler for tunnel server - balanced throughput."""
 
 import json
 import socket
@@ -92,9 +92,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 sock = self._connect(host, port)
                 sock.setblocking(False)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                # Increase socket buffers for better throughput
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256*1024)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256*1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 128*1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128*1024)
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
@@ -135,7 +134,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         raise OSError(f"Could not connect to {host}:{port}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """Fast data relay with minimal waiting."""
+        """Balanced TCP relay - reads available data without holding connection too long."""
         session.touch()
         
         if message == MSG_CLOSE:
@@ -143,7 +142,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(b"closed")
             return
         
-        # Forward to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -153,35 +151,49 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self._send(b"destination_closed")
                 return
         
-        # Read with short timeout - client will heartbeat quickly
+        # Read available data - quick drain, respond fast
         response = b""
         try:
-            # Only wait up to 100ms - client sends heartbeats frequently
-            deadline = time.time() + 0.1
-            while time.time() < deadline:
-                ready = select.select([session.socket], [], [], 0.05)
-                if ready[0]:
-                    try:
-                        chunk = session.socket.recv(65536)
-                        if not chunk:
-                            self.sessions.remove(session.id)
-                            response = b"destination_closed"
-                            break
-                        response += chunk
-                        session.record_received(len(chunk))
-                        if len(response) >= self.max_post_bytes - 2000:
-                            break
-                    except BlockingIOError:
-                        break
-                    except (ConnectionResetError, BrokenPipeError):
+            # First read: get whatever is available immediately
+            ready = select.select([session.socket], [], [], 0.05)
+            if ready[0]:
+                try:
+                    chunk = session.socket.recv(65536)
+                    if not chunk:
                         self.sessions.remove(session.id)
-                        response = b"destination_closed"
+                        self._send(b"destination_closed")
+                        return
+                    response = chunk
+                    session.record_received(len(chunk))
+                except BlockingIOError:
+                    pass
+                except (ConnectionResetError, BrokenPipeError):
+                    self.sessions.remove(session.id)
+                    self._send(b"destination_closed")
+                    return
+            
+            # If we got data, try to get more (but only if it's flowing fast)
+            if response and len(response) < 65536:
+                deadline = time.time() + 0.1
+                while time.time() < deadline and len(response) < 65536:
+                    ready = select.select([session.socket], [], [], 0.03)
+                    if ready[0]:
+                        try:
+                            chunk = session.socket.recv(65536)
+                            if not chunk:
+                                break
+                            response += chunk
+                            session.record_received(len(chunk))
+                        except BlockingIOError:
+                            break
+                        except (ConnectionResetError, BrokenPipeError):
+                            break
+                    else:
                         break
-                else:
-                    break
         except:
             self.sessions.remove(session.id)
-            response = b"destination_closed"
+            self._send(b"destination_closed")
+            return
         
         self._send(response if response else b"")
     

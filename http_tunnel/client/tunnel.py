@@ -1,4 +1,4 @@
-"""HTTP tunnel client - protocol-aware routing with HTTP/2."""
+"""HTTP tunnel client - protocol-aware routing with HTTP/1.1 connection pool."""
 
 import socket
 import time
@@ -8,7 +8,9 @@ import json
 import os
 import ipaddress
 
-import httpx
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from http_tunnel.crypto import TunnelCrypto
 from http_tunnel.protocol import (
@@ -30,48 +32,8 @@ def detect_protocol_from_first_byte(first_byte: int) -> str:
     return 'other'
 
 
-class HttpClientPool:
-    """Thread-safe pool of HTTP/2 clients."""
-    
-    def __init__(self, proxy_url=None, timeout=45, pool_size=2):
-        self._proxy_url = proxy_url
-        self._timeout = timeout
-        self._lock = threading.Lock()
-        self._index = 0
-        self._clients = []
-        for _ in range(pool_size):
-            limits = httpx.Limits(max_connections=2, max_keepalive_connections=2, keepalive_expiry=60)
-            transport = httpx.HTTPTransport(limits=limits, http2=True, proxy=proxy_url if proxy_url else None, retries=0)
-            client = httpx.Client(transport=transport, timeout=httpx.Timeout(timeout), http2=True)
-            self._clients.append(client)
-    
-    def get_client(self) -> httpx.Client:
-        with self._lock:
-            client = self._clients[self._index % len(self._clients)]
-            self._index += 1
-            return client
-    
-    def post(self, url, body, max_retries=2) -> str:
-        last_error = None
-        for attempt in range(max_retries):
-            client = self.get_client()
-            try:
-                resp = client.post(url, content=body, headers={"Content-Type": "text/plain"})
-                if resp.status_code == 502 and attempt < max_retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                return resp.text
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-        raise last_error or Exception("HTTP request failed")
-
-
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with HTTP/2 connection pool."""
+    """Bridges SOCKS5 to HTTP tunnel with HTTP/1.1 connection pool."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -82,10 +44,11 @@ class SocksToHttpTunnel:
         self.running = True
         
         self._using_proxy = False
-        proxy_url = None
         if self.config.get("outbound_http_proxy"):
-            proxy_url = self.config["outbound_http_proxy"]
+            self.proxies = {"http": self.config["outbound_http_proxy"], "https": self.config["outbound_http_proxy"]}
             self._using_proxy = True
+        else:
+            self.proxies = {}
         
         self.http_timeout = self.config["http_timeout"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
@@ -97,18 +60,14 @@ class SocksToHttpTunnel:
         self.route_tls = self.config.get("route_tls", "tunnel")
         self.route_http = self.config.get("route_http", "tunnel")
         self.route_other = self.config.get("route_other", "tunnel")
-        self.high_priority_ports = self.config.get("high_priority_ports", [22, 80, 443, 8080])
         socks_addr = self.config["socks_listen"].split(":")
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
-        
-        pool_size = 2 if self._using_proxy else 4
-        self._http_pool = HttpClientPool(proxy_url=proxy_url, timeout=self.http_timeout, pool_size=pool_size)
-        
+        self._setup_http_session()
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("Client ready (HTTP/2 pool)")
+        self.logger.info("Client ready")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -126,8 +85,33 @@ class SocksToHttpTunnel:
             except ValueError:
                 pass
     
+    def _setup_http_session(self):
+        self._session = requests.Session()
+        pool_hosts = 10
+        pool_max = 30
+        adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
+    
     def http_post(self, body: str, context: str = "unknown") -> str:
-        return self._http_pool.post(self.server_url, body)
+        headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
+        for attempt in range(2):
+            try:
+                resp = self._session.post(
+                    self.server_url, data=body, headers=headers,
+                    proxies=self.proxies if self._using_proxy else None,
+                    timeout=self.http_timeout
+                )
+                if resp.status_code == 502 and attempt < 1:
+                    time.sleep(self.reconnect_delay)
+                    continue
+                resp.raise_for_status()
+                return resp.text
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt < 1:
+                    time.sleep(self.reconnect_delay)
+                    continue
+                raise
     
     def _get_route_for_protocol(self, proto: str) -> str:
         if proto == 'tls':
@@ -346,7 +330,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"HTTP/2 pool | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"HTTP/1.1 pool | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
