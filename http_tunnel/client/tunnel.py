@@ -33,14 +33,12 @@ def detect_protocol_from_first_byte(first_byte: int) -> str:
 
 
 def is_websocket_upgrade(data: bytes) -> bool:
-    """Detect if data contains a WebSocket upgrade request."""
     return (b"Upgrade: websocket" in data or 
             b"upgrade: websocket" in data or 
             b"Upgrade: WebSocket" in data)
 
 
 def is_websocket_established(first_byte: int) -> bool:
-    """WebSocket frames: 0x81=text, 0x82=binary, 0x88=close, 0x89=ping, 0x8A=pong."""
     return first_byte in (0x81, 0x82, 0x88, 0x89, 0x8A)
 
 
@@ -289,12 +287,9 @@ class SocksToHttpTunnel:
             hb_max = 15
             bw = self.batch_wait
             
-            # Check if first byte indicates WebSocket frame
             if first_byte and len(first_byte) > 0 and is_websocket_established(first_byte[0]):
                 is_websocket = True
-                hb = 5
                 hb_max = 30
-                self.logger.debug(f"[{thread_id}] WebSocket detected, heartbeat: {hb}s")
             
             while self.running and session_id:
                 now = time.time()
@@ -307,12 +302,9 @@ class SocksToHttpTunnel:
                             return
                         buf += c
                         
-                        # Detect WebSocket upgrade in data stream
                         if not is_websocket and is_websocket_upgrade(buf):
                             is_websocket = True
-                            hb = 5
                             hb_max = 30
-                            self.logger.debug(f"[{thread_id}] WebSocket upgrade detected")
                         
                         if len(buf) >= self.max_bytes - 2000:
                             break
