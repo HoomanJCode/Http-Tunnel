@@ -27,13 +27,19 @@ def run_server():
     TunnelRequestHandler.tcp_timeout = config["tcp_timeout"]
     TunnelRequestHandler.udp_timeout = config["udp_timeout"]
     TunnelRequestHandler.connect_timeout = config["connect_timeout"]
+    TunnelRequestHandler.recv_buffer = config["recv_buffer"]
+    TunnelRequestHandler.send_buffer = config["send_buffer"]
+    TunnelRequestHandler.read_chunk = config["read_chunk"]
+    TunnelRequestHandler.read_timeout = config["read_timeout"]
+    TunnelRequestHandler.read_extend = config["read_extend"]
     cleaner = SessionCleaner(TunnelRequestHandler, config["cleanup_interval"])
     cleaner.start()
     host, port = config["listen"].split(":")
     server = HTTPServer((host, int(port)), TunnelRequestHandler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     logger.info(f"Listening on {host}:{port}")
-    logger.info(f"Connect timeout: {config['connect_timeout']}s, TCP: {config['tcp_timeout']}s")
+    logger.info(f"TCP timeout: {config['tcp_timeout']}s, UDP: {config['udp_timeout']}s")
+    logger.info(f"Buffers: recv={config['recv_buffer']}, send={config['send_buffer']}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

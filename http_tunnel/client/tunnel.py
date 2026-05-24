@@ -64,6 +64,9 @@ class SocksToHttpTunnel:
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
+        self.pool_hosts = self.config.get("pool_hosts", 10)
+        self.pool_max = self.config.get("pool_max", 30)
+        self.recv_chunk = self.config.get("recv_chunk", 65536)
         self._setup_http_session()
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
@@ -87,9 +90,7 @@ class SocksToHttpTunnel:
     
     def _setup_http_session(self):
         self._session = requests.Session()
-        pool_hosts = 10
-        pool_max = 30
-        adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
+        adapter = HTTPAdapter(pool_connections=self.pool_hosts, pool_maxsize=self.pool_max, max_retries=0, pool_block=False)
         self._session.mount('http://', adapter)
         self._session.mount('https://', adapter)
     
@@ -180,7 +181,7 @@ class SocksToHttpTunnel:
             while self.running:
                 try:
                     while True:
-                        c = local_conn.recv(65536)
+                        c = local_conn.recv(self.recv_chunk)
                         if not c:
                             return
                         remote.sendall(c)
@@ -190,7 +191,7 @@ class SocksToHttpTunnel:
                     return
                 try:
                     while True:
-                        c = remote.recv(65536)
+                        c = remote.recv(self.recv_chunk)
                         if not c:
                             return
                         local_conn.sendall(c)
@@ -228,7 +229,7 @@ class SocksToHttpTunnel:
             while self.running:
                 try:
                     while True:
-                        c = local_conn.recv(65536)
+                        c = local_conn.recv(self.recv_chunk)
                         if not c:
                             return
                         remote.sendall(c)
@@ -238,7 +239,7 @@ class SocksToHttpTunnel:
                     return
                 try:
                     while True:
-                        c = remote.recv(65536)
+                        c = remote.recv(self.recv_chunk)
                         if not c:
                             return
                         local_conn.sendall(c)
@@ -276,7 +277,7 @@ class SocksToHttpTunnel:
                 now = time.time()
                 try:
                     while True:
-                        c = local_conn.recv(65536)
+                        c = local_conn.recv(self.recv_chunk)
                         if not c:
                             self.logger.info(f"[{thread_id}] Closed")
                             self._close(session_id)
@@ -330,7 +331,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"HTTP/1.1 pool | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"Pool: {self.pool_hosts}/{self.pool_max} | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()

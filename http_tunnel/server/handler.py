@@ -20,6 +20,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     tcp_timeout: int = 60
     udp_timeout: int = 120
     connect_timeout: int = 8
+    recv_buffer: int = 131072
+    send_buffer: int = 131072
+    read_chunk: int = 65536
+    read_timeout: float = 0.05
+    read_extend: float = 0.1
     logger = None
     
     sessions = SessionManager()
@@ -92,8 +97,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 sock = self._connect(host, port)
                 sock.setblocking(False)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 128*1024)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128*1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.recv_buffer)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.send_buffer)
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
@@ -155,10 +160,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         response = b""
         try:
             # First read: get whatever is available immediately
-            ready = select.select([session.socket], [], [], 0.05)
+            ready = select.select([session.socket], [], [], self.read_timeout)
             if ready[0]:
                 try:
-                    chunk = session.socket.recv(65536)
+                    chunk = session.socket.recv(self.read_chunk)
                     if not chunk:
                         self.sessions.remove(session.id)
                         self._send(b"destination_closed")
@@ -173,13 +178,13 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     return
             
             # If we got data, try to get more (but only if it's flowing fast)
-            if response and len(response) < 65536:
-                deadline = time.time() + 0.1
-                while time.time() < deadline and len(response) < 65536:
+            if response and len(response) < self.read_chunk:
+                deadline = time.time() + self.read_extend
+                while time.time() < deadline and len(response) < self.read_chunk:
                     ready = select.select([session.socket], [], [], 0.03)
                     if ready[0]:
                         try:
-                            chunk = session.socket.recv(65536)
+                            chunk = session.socket.recv(self.read_chunk)
                             if not chunk:
                                 break
                             response += chunk

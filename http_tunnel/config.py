@@ -14,6 +14,11 @@ SERVER_CONFIG_PARAMS = {
     "udp_timeout": 120,
     "connect_timeout": 8,
     "cleanup_interval": 30,
+    "recv_buffer": 131072,       # Socket receive buffer (128KB)
+    "send_buffer": 131072,       # Socket send buffer (128KB)
+    "read_chunk": 65536,         # Max bytes per recv() call
+    "read_timeout": 0.05,        # Initial select timeout (seconds)
+    "read_extend": 0.1,          # Extension when data is flowing
     "log_level": "INFO"
 }
 
@@ -31,10 +36,13 @@ CLIENT_CONFIG_PARAMS = {
     "max_post_bytes": 5242880,
     "bypass_local": True,
     "bypass_ranges": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-    "route_tls": "tunnel",        # HTTPS, TLS-wrapped protocols
-    "route_http": "tunnel",       # Plain HTTP (GET/POST etc)
-    "route_other": "tunnel",      # Everything else (SSH, MTProto, etc)
+    "route_tls": "tunnel",
+    "route_http": "tunnel",
+    "route_other": "tunnel",
     "high_priority_ports": [22, 80, 443, 8080],
+    "pool_hosts": 10,            # Connection pool hosts
+    "pool_max": 30,              # Connection pool max per host
+    "recv_chunk": 65536,         # Bytes per recv() call
     "log_level": "INFO"
 }
 
@@ -95,6 +103,12 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     _prompt_float(config, "udp_timeout", "UDP idle timeout (s)", 120)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
     _prompt_float(config, "cleanup_interval", "Cleanup interval (s)", 30)
+    print("\nSocket Buffers (Enter for defaults):")
+    _prompt_int(config, "recv_buffer", "Socket receive buffer (bytes)", 131072)
+    _prompt_int(config, "send_buffer", "Socket send buffer (bytes)", 131072)
+    _prompt_int(config, "read_chunk", "Max read chunk (bytes)", 65536)
+    _prompt_float(config, "read_timeout", "Read timeout (s)", 0.05)
+    _prompt_float(config, "read_extend", "Read extend when flowing (s)", 0.1)
     print("\nLogging:")
     config["log_level"] = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper() or "INFO"
     config = clean_config(config, "server")
@@ -122,14 +136,8 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     config["outbound_http_proxy"] = input("Outbound proxy (empty=none): ").strip()
     print("\nDNS (server=no leaks):")
     config["dns_mode"] = input("DNS mode (local/server) [server]: ").strip().lower() or "server"
-    print("\nRouting by protocol (direct | proxy | tunnel):")
-    print("  direct = connect directly to internet")
-    print("  proxy  = route through outbound proxy")
-    print("  tunnel = route through HTTP tunnel")
-    print("\n  TLS = HTTPS, SSL, any TLS-wrapped traffic")
-    print("  HTTP = Plain HTTP (GET/POST without TLS)")
-    print("  Other = SSH, MTProto, unknown protocols")
-    route_tls = input("\nTLS routing [tunnel]: ").strip().lower()
+    print("\nRouting (direct | proxy | tunnel):")
+    route_tls = input("TLS routing [tunnel]: ").strip().lower()
     config["route_tls"] = route_tls if route_tls in ("direct", "proxy", "tunnel") else "tunnel"
     route_http = input("HTTP routing [tunnel]: ").strip().lower()
     config["route_http"] = route_http if route_http in ("direct", "proxy", "tunnel") else "tunnel"
@@ -142,6 +150,10 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
     _prompt_float(config, "batch_wait", "Batch wait (s, 0=instant)", 0.01)
     _prompt_float(config, "reconnect_delay", "Reconnect delay (s)", 0.5)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
+    print("\nConnection Pool (Enter for defaults):")
+    _prompt_int(config, "pool_hosts", "Pool hosts", 10)
+    _prompt_int(config, "pool_max", "Pool max connections", 30)
+    _prompt_int(config, "recv_chunk", "Recv chunk size (bytes)", 65536)
     print("\nBypass:")
     config["bypass_local"] = input("Bypass localhost? (Y/n) [Y]: ").strip().lower() != 'n'
     bypass_input = input("Bypass CIDRs (comma, Enter=defaults): ").strip()
