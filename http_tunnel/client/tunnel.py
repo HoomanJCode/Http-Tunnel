@@ -1,4 +1,4 @@
-"""HTTP tunnel client - protocol-aware routing."""
+"""HTTP tunnel client - HTTP/2 multiplexing for concurrent requests."""
 
 import socket
 import time
@@ -8,9 +8,7 @@ import json
 import os
 import ipaddress
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import httpx
 
 from http_tunnel.crypto import TunnelCrypto
 from http_tunnel.protocol import (
@@ -25,31 +23,15 @@ from http_tunnel.client.udp import UdpRelay
 
 
 def detect_protocol_from_first_byte(first_byte: int) -> str:
-    """Detect protocol from first byte of connection.
-    
-    Returns: 'tls', 'http', 'other'
-    """
     if first_byte == 0x16 or first_byte == 0x17:
         return 'tls'
-    if first_byte == 0x47:  # 'G' for GET
-        return 'http'
-    if first_byte == 0x50:  # 'P' for POST/PUT/PATCH
-        return 'http'
-    if first_byte == 0x48:  # 'H' for HEAD
-        return 'http'
-    if first_byte == 0x43:  # 'C' for CONNECT
-        return 'http'
-    if first_byte == 0x44:  # 'D' for DELETE
-        return 'http'
-    if first_byte == 0x4f:  # 'O' for OPTIONS
-        return 'http'
-    if first_byte == 0x54:  # 'T' for TRACE
+    if first_byte in (0x47, 0x50, 0x48, 0x43, 0x44, 0x4f, 0x54):
         return 'http'
     return 'other'
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with protocol-based routing."""
+    """Bridges SOCKS5 to HTTP tunnel with HTTP/2 multiplexing."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -58,11 +40,15 @@ class SocksToHttpTunnel:
         self.crypto = TunnelCrypto(self.config["encryption_key"])
         self.server_url = self.config["server_url"]
         self.running = True
+        
+        # Proxy settings
         self.proxies = {}
         self._using_proxy = False
+        self._proxy_url = None
         if self.config.get("outbound_http_proxy"):
-            self.proxies = {"http": self.config["outbound_http_proxy"], "https": self.config["outbound_http_proxy"]}
+            self._proxy_url = self.config["outbound_http_proxy"]
             self._using_proxy = True
+        
         self.http_timeout = self.config["http_timeout"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
         self.batch_wait = self.config["batch_wait"]
@@ -78,10 +64,13 @@ class SocksToHttpTunnel:
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
-        self._setup_http_session()
+        
+        # HTTP/2 client with multiplexing
+        self._setup_http2_client()
+        
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("Client ready")
+        self.logger.info("Client ready (HTTP/2)")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -99,28 +88,45 @@ class SocksToHttpTunnel:
             except ValueError:
                 pass
     
-    def _setup_http_session(self):
-        self._session = requests.Session()
-        pool_hosts = 10 if self._using_proxy else 50
-        pool_max = 20 if self._using_proxy else 100
-        adapter = HTTPAdapter(pool_connections=pool_hosts, pool_maxsize=pool_max, max_retries=0, pool_block=False)
-        self._session.mount('http://', adapter)
-        self._session.mount('https://', adapter)
+    def _setup_http2_client(self):
+        """Create HTTP/2 client with multiplexing support."""
+        limits = httpx.Limits(
+            max_connections=10,
+            max_keepalive_connections=5,
+            keepalive_expiry=30
+        )
+        
+        transport = httpx.HTTPTransport(
+            limits=limits,
+            http2=True,  # Enable HTTP/2
+            proxy=self._proxy_url if self._using_proxy else None,
+            retries=0
+        )
+        
+        self._client = httpx.Client(
+            transport=transport,
+            timeout=httpx.Timeout(self.http_timeout),
+            http2=True
+        )
     
     def http_post(self, body: str, context: str = "unknown") -> str:
-        headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
-        max_attempts = 2 if self._using_proxy else 3
-        for attempt in range(max_attempts):
+        """Send POST request via HTTP/2 multiplexed connection."""
+        headers = {"Content-Type": "text/plain"}
+        
+        for attempt in range(2 if self._using_proxy else 3):
             try:
-                resp = self._session.post(self.server_url, data=body, headers=headers,
-                                         proxies=self.proxies if self.proxies else None, timeout=self.http_timeout)
-                if resp.status_code == 502 and attempt < max_attempts - 1:
+                resp = self._client.post(
+                    self.server_url,
+                    content=body,
+                    headers=headers
+                )
+                if resp.status_code == 502 and attempt < (1 if self._using_proxy else 2):
                     time.sleep(self.reconnect_delay * (attempt + 1))
                     continue
                 resp.raise_for_status()
                 return resp.text
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                if attempt < max_attempts - 1:
+            except (httpx.TimeoutException, httpx.ConnectError):
+                if attempt < (1 if self._using_proxy else 2):
                     time.sleep(self.reconnect_delay * (attempt + 1))
                     continue
                 raise
@@ -147,9 +153,8 @@ class SocksToHttpTunnel:
     def handle_connection(self, conn: socket.socket, target_host: str, target_port: int, cmd: int, atyp: int):
         thread_id = threading.current_thread().name
         
-        # Reject IPv6
         if atyp == 4:
-            self.logger.debug(f"[{thread_id}] IPv6 rejected: {target_host}")
+            self.logger.debug(f"[{thread_id}] IPv6 rejected")
             conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         
@@ -158,27 +163,17 @@ class SocksToHttpTunnel:
                 self.udp.handle(conn, target_host, target_port, thread_id)
             return
         
-        # Send SOCKS5 success FIRST so the app starts sending data
         conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
         
-        # Now read first byte to detect protocol
+        # Protocol detection
         conn.setblocking(True)
         conn.settimeout(3)
         try:
-            first_byte_data = conn.recv(1)
-            if first_byte_data:
-                first_byte = first_byte_data[0]
-                proto = detect_protocol_from_first_byte(first_byte)
-                self.logger.debug(f"[{thread_id}] First byte: 0x{first_byte:02x} -> {proto}")
-            else:
-                proto = 'other'
-                first_byte_data = b''
-        except socket.timeout:
-            proto = 'other'
-            first_byte_data = b''
+            fb = conn.recv(1)
+            proto = detect_protocol_from_first_byte(fb[0]) if fb else 'other'
         except:
             proto = 'other'
-            first_byte_data = b''
+            fb = b''
         conn.setblocking(True)
         conn.settimeout(10)
         
@@ -186,13 +181,13 @@ class SocksToHttpTunnel:
         self.logger.info(f"[{thread_id}] {proto}:{target_port} -> {route} ({target_host}:{target_port})")
         
         if route == "direct":
-            self._handle_direct(conn, target_host, target_port, thread_id, first_byte_data)
+            self._handle_direct(conn, target_host, target_port, thread_id, fb)
         elif route == "proxy" and self._using_proxy:
-            self._handle_via_proxy(conn, target_host, target_port, thread_id, first_byte_data)
+            self._handle_via_proxy(conn, target_host, target_port, thread_id, fb)
         elif self.should_bypass(target_host):
             self.direct.handle(conn, target_host, target_port, thread_id)
         else:
-            self._handle_tunnel(conn, target_host, target_port, thread_id, first_byte_data)
+            self._handle_tunnel(conn, target_host, target_port, thread_id, fb)
     
     def _handle_direct(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         remote = None
@@ -225,7 +220,7 @@ class SocksToHttpTunnel:
                     return
                 time.sleep(0.001)
         except Exception as e:
-            self.logger.error(f"[{thread_id}] Direct error: {e}")
+            self.logger.error(f"[{thread_id}] Direct: {e}")
         finally:
             if remote:
                 try:
@@ -273,7 +268,7 @@ class SocksToHttpTunnel:
                     return
                 time.sleep(0.001)
         except Exception as e:
-            self.logger.error(f"[{thread_id}] Proxy error: {e}")
+            self.logger.error(f"[{thread_id}] Proxy: {e}")
         finally:
             if remote:
                 try:
@@ -296,7 +291,7 @@ class SocksToHttpTunnel:
             buf = first_byte if first_byte else b""
             last = time.time()
             hb = self.heartbeat_interval
-            bw = 0 if self._using_proxy else (self.batch_wait * (0.5 if target_port in self.high_priority_ports else 1) if self.batch_wait > 0 else 0)
+            bw = self.batch_wait
             while self.running and session_id:
                 now = time.time()
                 try:
@@ -322,7 +317,7 @@ class SocksToHttpTunnel:
                 if send:
                     payload = buf[:self.max_bytes - 2000] if buf else MSG_HEARTBEAT
                     buf = buf[self.max_bytes - 2000:] if buf else b""
-                    hb = self.heartbeat_interval if buf else min(hb * 1.5, 15 if self._using_proxy else 30)
+                    hb = self.heartbeat_interval if buf else min(hb * 1.5, 15)
                     try:
                         resp_text = self.http_post(self.crypto.encrypt(create_session_message(session_id, payload)), f"{thread_id}")
                         plain = self.crypto.decrypt(resp_text)
@@ -355,8 +350,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"TLS: {self.route_tls} | HTTP: {self.route_http} | Other: {self.route_other}")
-        self.logger.info(f"DNS: {self.dns_mode}")
+        self.logger.info(f"HTTP/2 multiplexing | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
