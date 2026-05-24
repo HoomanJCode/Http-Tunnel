@@ -90,3 +90,11 @@ def is_tls_data(data: bytes) -> bool:
     if len(data) < 3:
         return False
     return data[0] in [0x16, 0x17]
+    
+def is_websocket_upgrade(data: bytes) -> bool:
+    """Detect if data contains a WebSocket upgrade request."""
+    return b"Upgrade: websocket" in data or b"upgrade: websocket" in data or b"Upgrade: WebSocket" in data
+
+def is_websocket_established(first_byte: int) -> bool:
+    """WebSocket frames start with 0x81 (text), 0x82 (binary), 0x88 (close), 0x89 (ping), 0x8A (pong)."""
+    return first_byte in (0x81, 0x82, 0x88, 0x89, 0x8A)

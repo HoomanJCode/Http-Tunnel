@@ -139,13 +139,18 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         raise OSError(f"Could not connect to {host}:{port}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """Balanced TCP relay - reads available data without holding connection too long."""
+        """TCP relay with WebSocket detection for longer read windows."""
         session.touch()
         
         if message == MSG_CLOSE:
             self.sessions.remove(session.id)
             self._send(b"closed")
             return
+        
+        # Detect WebSocket upgrade in the message
+        ws_upgrade = (b"Upgrade: websocket" in message or 
+                      b"upgrade: websocket" in message or
+                      b"Upgrade: WebSocket" in message)
         
         if message and message != MSG_HEARTBEAT:
             try:
@@ -156,11 +161,13 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self._send(b"destination_closed")
                 return
         
-        # Read available data - quick drain, respond fast
+        # WebSocket gets longer read window
+        rt = 0.2 if ws_upgrade else self.read_timeout
+        re = 0.3 if ws_upgrade else self.read_extend
+        
         response = b""
         try:
-            # First read: get whatever is available immediately
-            ready = select.select([session.socket], [], [], self.read_timeout)
+            ready = select.select([session.socket], [], [], rt)
             if ready[0]:
                 try:
                     chunk = session.socket.recv(self.read_chunk)
@@ -170,6 +177,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         return
                     response = chunk
                     session.record_received(len(chunk))
+                    # Detect WebSocket frames in response
+                    if chunk and chunk[0] in (0x81, 0x82, 0x88, 0x89, 0x8A):
+                        ws_upgrade = True
+                        re = 0.3
                 except BlockingIOError:
                     pass
                 except (ConnectionResetError, BrokenPipeError):
@@ -177,9 +188,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     self._send(b"destination_closed")
                     return
             
-            # If we got data, try to get more (but only if it's flowing fast)
             if response and len(response) < self.read_chunk:
-                deadline = time.time() + self.read_extend
+                deadline = time.time() + re
                 while time.time() < deadline and len(response) < self.read_chunk:
                     ready = select.select([session.socket], [], [], 0.03)
                     if ready[0]:
