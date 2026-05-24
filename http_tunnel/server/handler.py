@@ -56,7 +56,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     self._send(b"pong")
                     return
                 elif msg.get("type") == "connect":
-                    self.logger.info(f"[{client}] CONNECT {msg.get('host')}:{msg.get('port')}")
                     self._handle_connect(msg)
                     return
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -76,7 +75,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         except Exception as e:
-            self.logger.error(f"[{client}] Error: {e}")
+            self.logger.error(f"Error: {e}")
     
     def _handle_connect(self, msg: dict):
         host = msg.get("host")
@@ -93,11 +92,13 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 sock = self._connect(host, port)
                 sock.setblocking(False)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Increase socket buffers for better throughput
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256*1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256*1024)
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
         except Exception as e:
-            self.logger.error(f"Connect failed {host}:{port}: {e}")
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
     
     def _connect(self, host: str, port: int) -> socket.socket:
@@ -134,22 +135,15 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         raise OSError(f"Could not connect to {host}:{port}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """Handle TCP data relay.
-        
-        After forwarding data to destination, reads response with adaptive timing:
-        - First read after forwarding: wait up to 2s (TLS handshake can be slow)
-        - Subsequent reads: wait up to 0.3s (application data is faster)
-        - Uses session.requests count to detect if this is first exchange
-        """
+        """Fast data relay with minimal waiting."""
         session.touch()
         
         if message == MSG_CLOSE:
-            self.logger.info(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
             self._send(b"closed")
             return
         
-        # Forward raw data to destination
+        # Forward to destination
         if message and message != MSG_HEARTBEAT:
             try:
                 session.socket.sendall(message)
@@ -159,15 +153,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 self._send(b"destination_closed")
                 return
         
-        # Read response with adaptive timeout
-        # First few exchanges (TLS handshake) need longer wait
-        is_early = session.requests < 5
-        max_wait = 2.0 if is_early else 0.3
-        extend_wait = 0.5 if is_early else 0.1
-        
+        # Read with short timeout - client will heartbeat quickly
         response = b""
         try:
-            deadline = time.time() + max_wait
+            # Only wait up to 100ms - client sends heartbeats frequently
+            deadline = time.time() + 0.1
             while time.time() < deadline:
                 ready = select.select([session.socket], [], [], 0.05)
                 if ready[0]:
@@ -181,8 +171,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         session.record_received(len(chunk))
                         if len(response) >= self.max_post_bytes - 2000:
                             break
-                        # Got data - extend deadline for more fragments
-                        deadline = min(deadline, time.time() + extend_wait)
                     except BlockingIOError:
                         break
                     except (ConnectionResetError, BrokenPipeError):
@@ -190,9 +178,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                         response = b"destination_closed"
                         break
                 else:
-                    # No data yet - keep waiting if we haven't received anything
-                    if response:
-                        break
+                    break
         except:
             self.sessions.remove(session.id)
             response = b"destination_closed"

@@ -1,4 +1,4 @@
-"""HTTP tunnel client - HTTP/2 with connection pool for stability."""
+"""HTTP tunnel client - protocol-aware routing with HTTP/2."""
 
 import socket
 import time
@@ -31,46 +31,27 @@ def detect_protocol_from_first_byte(first_byte: int) -> str:
 
 
 class HttpClientPool:
-    """Thread-safe pool of HTTP/2 clients for connection reuse."""
+    """Thread-safe pool of HTTP/2 clients."""
     
-    def __init__(self, proxy_url=None, timeout=45, pool_size=4):
+    def __init__(self, proxy_url=None, timeout=45, pool_size=2):
         self._proxy_url = proxy_url
         self._timeout = timeout
-        self._pool_size = pool_size
-        self._clients = []
         self._lock = threading.Lock()
         self._index = 0
-        self._create_clients()
-    
-    def _create_clients(self):
-        for _ in range(self._pool_size):
-            limits = httpx.Limits(
-                max_connections=5,
-                max_keepalive_connections=2,
-                keepalive_expiry=30
-            )
-            transport = httpx.HTTPTransport(
-                limits=limits,
-                http2=True,
-                proxy=self._proxy_url if self._proxy_url else None,
-                retries=0
-            )
-            client = httpx.Client(
-                transport=transport,
-                timeout=httpx.Timeout(self._timeout),
-                http2=True
-            )
+        self._clients = []
+        for _ in range(pool_size):
+            limits = httpx.Limits(max_connections=2, max_keepalive_connections=2, keepalive_expiry=60)
+            transport = httpx.HTTPTransport(limits=limits, http2=True, proxy=proxy_url if proxy_url else None, retries=0)
+            client = httpx.Client(transport=transport, timeout=httpx.Timeout(timeout), http2=True)
             self._clients.append(client)
     
     def get_client(self) -> httpx.Client:
-        """Get a client in round-robin fashion (thread-safe)."""
         with self._lock:
-            client = self._clients[self._index % self._pool_size]
+            client = self._clients[self._index % len(self._clients)]
             self._index += 1
             return client
     
     def post(self, url, body, max_retries=2) -> str:
-        """Send POST with automatic retry and client rotation."""
         last_error = None
         for attempt in range(max_retries):
             client = self.get_client()
@@ -100,7 +81,6 @@ class SocksToHttpTunnel:
         self.server_url = self.config["server_url"]
         self.running = True
         
-        # Proxy settings
         self._using_proxy = False
         proxy_url = None
         if self.config.get("outbound_http_proxy"):
@@ -123,13 +103,8 @@ class SocksToHttpTunnel:
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
         
-        # HTTP/2 client pool - 4 clients for stability
-        pool_size = 4 if self._using_proxy else 8
-        self._http_pool = HttpClientPool(
-            proxy_url=proxy_url,
-            timeout=self.http_timeout,
-            pool_size=pool_size
-        )
+        pool_size = 2 if self._using_proxy else 4
+        self._http_pool = HttpClientPool(proxy_url=proxy_url, timeout=self.http_timeout, pool_size=pool_size)
         
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
@@ -177,7 +152,6 @@ class SocksToHttpTunnel:
         thread_id = threading.current_thread().name
         
         if atyp == 4:
-            self.logger.debug(f"[{thread_id}] IPv6 rejected")
             conn.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         
@@ -222,7 +196,7 @@ class SocksToHttpTunnel:
             while self.running:
                 try:
                     while True:
-                        c = local_conn.recv(8192)
+                        c = local_conn.recv(65536)
                         if not c:
                             return
                         remote.sendall(c)
@@ -232,7 +206,7 @@ class SocksToHttpTunnel:
                     return
                 try:
                     while True:
-                        c = remote.recv(8192)
+                        c = remote.recv(65536)
                         if not c:
                             return
                         local_conn.sendall(c)
@@ -270,7 +244,7 @@ class SocksToHttpTunnel:
             while self.running:
                 try:
                     while True:
-                        c = local_conn.recv(8192)
+                        c = local_conn.recv(65536)
                         if not c:
                             return
                         remote.sendall(c)
@@ -280,7 +254,7 @@ class SocksToHttpTunnel:
                     return
                 try:
                     while True:
-                        c = remote.recv(8192)
+                        c = remote.recv(65536)
                         if not c:
                             return
                         local_conn.sendall(c)
@@ -318,7 +292,7 @@ class SocksToHttpTunnel:
                 now = time.time()
                 try:
                     while True:
-                        c = local_conn.recv(8192)
+                        c = local_conn.recv(65536)
                         if not c:
                             self.logger.info(f"[{thread_id}] Closed")
                             self._close(session_id)
