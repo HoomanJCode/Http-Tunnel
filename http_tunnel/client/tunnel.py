@@ -270,6 +270,7 @@ class SocksToHttpTunnel:
     def _handle_tunnel(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         session_id = None
         is_websocket = False
+        fast_drain = False
         
         try:
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
@@ -312,12 +313,14 @@ class SocksToHttpTunnel:
                     pass
                 except:
                     return
+                
                 send = False
                 if len(buf) > 0:
                     if bw == 0 or len(buf) >= self.max_bytes - 2000 or (now - last) >= bw:
                         send = True
-                elif (now - last) >= hb:
+                elif (now - last) >= hb or fast_drain:
                     send = True
+                
                 if send:
                     payload = buf[:self.max_bytes - 2000] if buf else MSG_HEARTBEAT
                     buf = buf[self.max_bytes - 2000:] if buf else b""
@@ -334,6 +337,18 @@ class SocksToHttpTunnel:
                                 local_conn.sendall(plain)
                             except:
                                 return
+                            
+                            # Adaptive draining: if server sent large response,
+                            # it probably has more data. Send next request faster.
+                            if len(plain) > 32768:
+                                fast_drain = True
+                                hb = 0.05
+                                bw = 0
+                            else:
+                                fast_drain = False
+                                hb = self.heartbeat_interval
+                                bw = self.batch_wait
+                        
                         last = now
                     except Exception as e:
                         self.logger.error(f"[{thread_id}] {e}")
