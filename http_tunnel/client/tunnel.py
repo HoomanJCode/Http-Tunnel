@@ -1,4 +1,4 @@
-"""HTTP tunnel client - HTTP/2 multiplexing for concurrent requests."""
+"""HTTP tunnel client - HTTP/2 with connection pool for stability."""
 
 import socket
 import time
@@ -30,8 +30,67 @@ def detect_protocol_from_first_byte(first_byte: int) -> str:
     return 'other'
 
 
+class HttpClientPool:
+    """Thread-safe pool of HTTP/2 clients for connection reuse."""
+    
+    def __init__(self, proxy_url=None, timeout=45, pool_size=4):
+        self._proxy_url = proxy_url
+        self._timeout = timeout
+        self._pool_size = pool_size
+        self._clients = []
+        self._lock = threading.Lock()
+        self._index = 0
+        self._create_clients()
+    
+    def _create_clients(self):
+        for _ in range(self._pool_size):
+            limits = httpx.Limits(
+                max_connections=5,
+                max_keepalive_connections=2,
+                keepalive_expiry=30
+            )
+            transport = httpx.HTTPTransport(
+                limits=limits,
+                http2=True,
+                proxy=self._proxy_url if self._proxy_url else None,
+                retries=0
+            )
+            client = httpx.Client(
+                transport=transport,
+                timeout=httpx.Timeout(self._timeout),
+                http2=True
+            )
+            self._clients.append(client)
+    
+    def get_client(self) -> httpx.Client:
+        """Get a client in round-robin fashion (thread-safe)."""
+        with self._lock:
+            client = self._clients[self._index % self._pool_size]
+            self._index += 1
+            return client
+    
+    def post(self, url, body, max_retries=2) -> str:
+        """Send POST with automatic retry and client rotation."""
+        last_error = None
+        for attempt in range(max_retries):
+            client = self.get_client()
+            try:
+                resp = client.post(url, content=body, headers={"Content-Type": "text/plain"})
+                if resp.status_code == 502 and attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                return resp.text
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+        raise last_error or Exception("HTTP request failed")
+
+
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with HTTP/2 multiplexing."""
+    """Bridges SOCKS5 to HTTP tunnel with HTTP/2 connection pool."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -42,11 +101,10 @@ class SocksToHttpTunnel:
         self.running = True
         
         # Proxy settings
-        self.proxies = {}
         self._using_proxy = False
-        self._proxy_url = None
+        proxy_url = None
         if self.config.get("outbound_http_proxy"):
-            self._proxy_url = self.config["outbound_http_proxy"]
+            proxy_url = self.config["outbound_http_proxy"]
             self._using_proxy = True
         
         self.http_timeout = self.config["http_timeout"]
@@ -65,12 +123,17 @@ class SocksToHttpTunnel:
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
         
-        # HTTP/2 client with multiplexing
-        self._setup_http2_client()
+        # HTTP/2 client pool - 4 clients for stability
+        pool_size = 4 if self._using_proxy else 8
+        self._http_pool = HttpClientPool(
+            proxy_url=proxy_url,
+            timeout=self.http_timeout,
+            pool_size=pool_size
+        )
         
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("Client ready (HTTP/2)")
+        self.logger.info("Client ready (HTTP/2 pool)")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -88,48 +151,8 @@ class SocksToHttpTunnel:
             except ValueError:
                 pass
     
-    def _setup_http2_client(self):
-        """Create HTTP/2 client with multiplexing support."""
-        limits = httpx.Limits(
-            max_connections=10,
-            max_keepalive_connections=5,
-            keepalive_expiry=30
-        )
-        
-        transport = httpx.HTTPTransport(
-            limits=limits,
-            http2=True,  # Enable HTTP/2
-            proxy=self._proxy_url if self._using_proxy else None,
-            retries=0
-        )
-        
-        self._client = httpx.Client(
-            transport=transport,
-            timeout=httpx.Timeout(self.http_timeout),
-            http2=True
-        )
-    
     def http_post(self, body: str, context: str = "unknown") -> str:
-        """Send POST request via HTTP/2 multiplexed connection."""
-        headers = {"Content-Type": "text/plain"}
-        
-        for attempt in range(2 if self._using_proxy else 3):
-            try:
-                resp = self._client.post(
-                    self.server_url,
-                    content=body,
-                    headers=headers
-                )
-                if resp.status_code == 502 and attempt < (1 if self._using_proxy else 2):
-                    time.sleep(self.reconnect_delay * (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                return resp.text
-            except (httpx.TimeoutException, httpx.ConnectError):
-                if attempt < (1 if self._using_proxy else 2):
-                    time.sleep(self.reconnect_delay * (attempt + 1))
-                    continue
-                raise
+        return self._http_pool.post(self.server_url, body)
     
     def _get_route_for_protocol(self, proto: str) -> str:
         if proto == 'tls':
@@ -165,7 +188,6 @@ class SocksToHttpTunnel:
         
         conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
         
-        # Protocol detection
         conn.setblocking(True)
         conn.settimeout(3)
         try:
@@ -350,7 +372,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"HTTP/2 multiplexing | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"HTTP/2 pool | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
