@@ -44,7 +44,7 @@ def is_websocket_established(first_byte: int) -> bool:
 class HttpSessionPool:
     """Pool of HTTP sessions for concurrent tunnel requests."""
     
-    def __init__(self, proxy_url=None, pool_size=20):
+    def __init__(self, proxy_url=None, pool_size=30):
         self._proxy_url = proxy_url
         self._pool = []
         self._lock = threading.Lock()
@@ -64,7 +64,7 @@ class HttpSessionPool:
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with concurrent HTTP sessions."""
+    """Bridges SOCKS5 to HTTP tunnel with configurable parameters."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -82,6 +82,7 @@ class SocksToHttpTunnel:
         
         self.http_timeout = self.config["http_timeout"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
+        self.heartbeat_max = self.config.get("heartbeat_max", 15)
         self.batch_wait = self.config["batch_wait"]
         self.reconnect_delay = self.config["reconnect_delay"]
         self.max_bytes = self.config["max_post_bytes"]
@@ -95,18 +96,17 @@ class SocksToHttpTunnel:
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
         self.recv_chunk = self.config.get("recv_chunk", 65536)
+        self.fast_drain_threshold = self.config.get("fast_drain_threshold", 32768)
+        self.fast_drain_interval = self.config.get("fast_drain_interval", 0.05)
+        self.http_pool_size = self.config.get("http_pool_size", 30)
         
-        # Per-thread HTTP session pool
-        pool_size = 30
-        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=pool_size)
-        
-        # Thread-local storage for session assignment
+        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size)
         self._thread_sessions = {}
         self._thread_lock = threading.Lock()
         
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info(f"Client ready ({pool_size} HTTP sessions)")
+        self.logger.info("Client ready")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -125,7 +125,6 @@ class SocksToHttpTunnel:
                 pass
     
     def _get_session(self) -> requests.Session:
-        """Get or assign an HTTP session for the current thread."""
         tid = threading.current_thread().ident
         with self._thread_lock:
             if tid not in self._thread_sessions:
@@ -137,18 +136,20 @@ class SocksToHttpTunnel:
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
         proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
         
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 resp = session.post(self.server_url, data=body, headers=headers,
                                    proxies=proxies, timeout=self.http_timeout)
-                if resp.status_code == 502 and attempt < 1:
-                    time.sleep(self.reconnect_delay)
-                    continue
+                if resp.status_code == 502:
+                    if attempt < 2:
+                        time.sleep(self.reconnect_delay * (2 ** attempt))
+                        continue
+                    raise Exception("Server returned 502 after retries")
                 resp.raise_for_status()
                 return resp.text
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                if attempt < 1:
-                    time.sleep(self.reconnect_delay)
+                if attempt < 2:
+                    time.sleep(self.reconnect_delay * (2 ** attempt))
                     continue
                 raise
     
@@ -299,8 +300,13 @@ class SocksToHttpTunnel:
         session_id = None
         is_websocket = False
         fast_drain = False
+        close_sent = False
+        hb = self.heartbeat_interval
+        hb_max = self.heartbeat_max
+        bw = self.batch_wait
         
         try:
+            # Establish tunnel
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
             resp = self.http_post(self.crypto.encrypt(connect_msg.encode()), f"{thread_id}-c")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
@@ -308,14 +314,17 @@ class SocksToHttpTunnel:
                 self.logger.error(f"[{thread_id}] Refused: {resp_data.get('reason','?')}")
                 return
             session_id = resp_data["session"]
+            
+            # Send first byte immediately if we have it
+            if first_byte:
+                self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
+            
             self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
             local_conn.setblocking(False)
-            buf = first_byte if first_byte else b""
+            buf = b""
             last = time.time()
-            hb = self.heartbeat_interval
-            hb_max = 15
-            bw = self.batch_wait
             
+            # WebSocket detection from first byte
             if first_byte and len(first_byte) > 0 and is_websocket_established(first_byte[0]):
                 is_websocket = True
                 hb_max = 30
@@ -327,7 +336,8 @@ class SocksToHttpTunnel:
                         c = local_conn.recv(self.recv_chunk)
                         if not c:
                             self.logger.info(f"[{thread_id}] Closed")
-                            self._close(session_id)
+                            if not close_sent:
+                                self._close(session_id)
                             return
                         buf += c
                         
@@ -340,35 +350,46 @@ class SocksToHttpTunnel:
                 except BlockingIOError:
                     pass
                 except:
+                    if not close_sent:
+                        self._close(session_id)
                     return
                 
                 send = False
                 if len(buf) > 0:
                     if bw == 0 or len(buf) >= self.max_bytes - 2000 or (now - last) >= bw:
                         send = True
-                elif (now - last) >= hb or fast_drain:
+                elif (now - last) >= hb:
                     send = True
                 
                 if send:
-                    payload = buf[:self.max_bytes - 2000] if buf else MSG_HEARTBEAT
-                    buf = buf[self.max_bytes - 2000:] if buf else b""
+                    if len(buf) > 0:
+                        payload = buf[:self.max_bytes - 2000]
+                        buf = buf[self.max_bytes - 2000:]
+                    else:
+                        payload = MSG_HEARTBEAT
+                    
                     if not is_websocket:
                         hb = self.heartbeat_interval if buf else min(hb * 1.5, hb_max)
+                    
                     try:
                         resp_text = self.http_post(self.crypto.encrypt(create_session_message(session_id, payload)), f"{thread_id}")
                         plain = self.crypto.decrypt(resp_text)
+                        
                         if plain in [b"destination_closed", b"invalid_session", b"closed"]:
                             self.logger.info(f"[{thread_id}] {plain.decode()}")
+                            close_sent = True
                             return
+                        
                         if plain:
                             try:
                                 local_conn.sendall(plain)
                             except:
                                 return
                             
-                            if len(plain) > 32768:
+                            # Adaptive draining based on response size
+                            if len(plain) > self.fast_drain_threshold:
                                 fast_drain = True
-                                hb = 0.05
+                                hb = self.fast_drain_interval
                                 bw = 0
                             else:
                                 fast_drain = False
@@ -383,7 +404,7 @@ class SocksToHttpTunnel:
         except Exception as e:
             self.logger.error(f"[{thread_id}] {e}")
         finally:
-            if session_id:
+            if session_id and not close_sent:
                 self._close(session_id)
     
     def _close(self, sid):
@@ -397,6 +418,7 @@ class SocksToHttpTunnel:
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
         self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"Pool:{self.http_pool_size} HB:{self.heartbeat_interval}s Drain:>{self.fast_drain_threshold}B")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
