@@ -4,6 +4,7 @@ import json
 import socket
 import time
 import select
+import threading
 from http.server import BaseHTTPRequestHandler
 
 from http_tunnel.crypto import TunnelCrypto
@@ -28,8 +29,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     logger = None
     
     sessions = SessionManager()
-    ip_sessions = {}  # Track sessions per IP: {ip: [session_ids]}
-    ip_lock = __import__('threading').Lock()
+    ip_sessions = {}  # Class-level: shared across all handler instances
+    ip_lock = threading.Lock()
     
     def handle_one_request(self):
         try:
@@ -83,32 +84,35 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.logger.error(f"Error: {e}")
     
-    def _count_ip_sessions(self, ip: str) -> int:
-        with self.ip_lock:
-            return len(self.ip_sessions.get(ip, []))
+    @classmethod
+    def _count_ip_sessions(cls, ip: str) -> int:
+        with cls.ip_lock:
+            return len(cls.ip_sessions.get(ip, []))
     
-    def _add_ip_session(self, ip: str, session_id: str):
-        with self.ip_lock:
-            if ip not in self.ip_sessions:
-                self.ip_sessions[ip] = []
-            self.ip_sessions[ip].append(session_id)
+    @classmethod
+    def _add_ip_session(cls, ip: str, session_id: str):
+        with cls.ip_lock:
+            if ip not in cls.ip_sessions:
+                cls.ip_sessions[ip] = []
+            cls.ip_sessions[ip].append(session_id)
     
-    def _remove_ip_session(self, ip: str, session_id: str):
-        with self.ip_lock:
-            if ip in self.ip_sessions and session_id in self.ip_sessions[ip]:
-                self.ip_sessions[ip].remove(session_id)
-                if not self.ip_sessions[ip]:
-                    del self.ip_sessions[ip]
+    @classmethod
+    def _remove_ip_session(cls, ip: str, session_id: str):
+        with cls.ip_lock:
+            if ip in cls.ip_sessions and session_id in cls.ip_sessions[ip]:
+                cls.ip_sessions[ip].remove(session_id)
+                if not cls.ip_sessions[ip]:
+                    del cls.ip_sessions[ip]
     
-    def _cleanup_ip_sessions(self, ip: str):
-        """Remove dead sessions for an IP from tracking."""
-        with self.ip_lock:
-            if ip in self.ip_sessions:
-                alive = [sid for sid in self.ip_sessions[ip] if self.sessions.get(sid)]
+    @classmethod
+    def _cleanup_ip_sessions(cls, ip: str):
+        with cls.ip_lock:
+            if ip in cls.ip_sessions:
+                alive = [sid for sid in cls.ip_sessions[ip] if cls.sessions.get(sid)]
                 if alive:
-                    self.ip_sessions[ip] = alive
+                    cls.ip_sessions[ip] = alive
                 else:
-                    del self.ip_sessions[ip]
+                    del cls.ip_sessions[ip]
     
     def _handle_connect(self, msg: dict, client_ip: str):
         host = msg.get("host")
@@ -118,13 +122,11 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"status": "error", "reason": "Missing host/port"}).encode())
             return
         
-        # Clean up dead sessions for this IP
         self._cleanup_ip_sessions(client_ip)
-        
-        # Check limit
         count = self._count_ip_sessions(client_ip)
+        
         if count >= self.max_sessions_per_ip:
-            self.logger.warning(f"[{client_ip}] Connection limit reached ({count}/{self.max_sessions_per_ip})")
+            self.logger.warning(f"[{client_ip}] Limit reached ({count}/{self.max_sessions_per_ip})")
             self._send(json.dumps({"status": "error", "reason": f"Too many connections ({count})"}).encode())
             return
         
@@ -141,7 +143,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
             self._add_ip_session(client_ip, session.id)
-            self.logger.debug(f"[{client_ip}] Session {session.id} ({count+1}/{self.max_sessions_per_ip})")
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
         except Exception as e:
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
@@ -183,7 +184,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         session.touch()
         
         if message == MSG_CLOSE:
-            self.logger.debug(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
             self._remove_ip_session(client, session.id)
             self._send(b"closed")
