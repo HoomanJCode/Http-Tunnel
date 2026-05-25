@@ -1,11 +1,10 @@
-"""HTTP request handler for tunnel server - balanced throughput."""
+"""HTTP request handler for tunnel server - with per-IP connection limits."""
 
 import json
 import socket
 import time
 import select
 from http.server import BaseHTTPRequestHandler
-from concurrent.futures import ThreadPoolExecutor
 
 from http_tunnel.crypto import TunnelCrypto
 from http_tunnel.protocol import PROTO_TCP, PROTO_UDP, MSG_CLOSE, MSG_HEARTBEAT
@@ -23,12 +22,14 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     recv_buffer: int = 131072
     send_buffer: int = 131072
     read_chunk: int = 65536
-    read_timeout: float = 0.05
-    read_extend: float = 0.1
+    read_timeout: float = 0.01
+    read_extend: float = 0.03
+    max_sessions_per_ip: int = 30
     logger = None
     
     sessions = SessionManager()
-    executor = ThreadPoolExecutor(max_workers=50)
+    ip_sessions = {}  # Track sessions per IP: {ip: [session_ids]}
+    ip_lock = __import__('threading').Lock()
     
     def handle_one_request(self):
         try:
@@ -61,7 +62,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     self._send(b"pong")
                     return
                 elif msg.get("type") == "connect":
-                    self._handle_connect(msg)
+                    self._handle_connect(msg, client)
                     return
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
@@ -82,13 +83,51 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.logger.error(f"Error: {e}")
     
-    def _handle_connect(self, msg: dict):
+    def _count_ip_sessions(self, ip: str) -> int:
+        with self.ip_lock:
+            return len(self.ip_sessions.get(ip, []))
+    
+    def _add_ip_session(self, ip: str, session_id: str):
+        with self.ip_lock:
+            if ip not in self.ip_sessions:
+                self.ip_sessions[ip] = []
+            self.ip_sessions[ip].append(session_id)
+    
+    def _remove_ip_session(self, ip: str, session_id: str):
+        with self.ip_lock:
+            if ip in self.ip_sessions and session_id in self.ip_sessions[ip]:
+                self.ip_sessions[ip].remove(session_id)
+                if not self.ip_sessions[ip]:
+                    del self.ip_sessions[ip]
+    
+    def _cleanup_ip_sessions(self, ip: str):
+        """Remove dead sessions for an IP from tracking."""
+        with self.ip_lock:
+            if ip in self.ip_sessions:
+                alive = [sid for sid in self.ip_sessions[ip] if self.sessions.get(sid)]
+                if alive:
+                    self.ip_sessions[ip] = alive
+                else:
+                    del self.ip_sessions[ip]
+    
+    def _handle_connect(self, msg: dict, client_ip: str):
         host = msg.get("host")
         port = msg.get("port")
         proto = msg.get("proto", PROTO_TCP)
         if not host or not port:
-            self._send(json.dumps({"status": "error"}).encode())
+            self._send(json.dumps({"status": "error", "reason": "Missing host/port"}).encode())
             return
+        
+        # Clean up dead sessions for this IP
+        self._cleanup_ip_sessions(client_ip)
+        
+        # Check limit
+        count = self._count_ip_sessions(client_ip)
+        if count >= self.max_sessions_per_ip:
+            self.logger.warning(f"[{client_ip}] Connection limit reached ({count}/{self.max_sessions_per_ip})")
+            self._send(json.dumps({"status": "error", "reason": f"Too many connections ({count})"}).encode())
+            return
+        
         try:
             if proto == PROTO_UDP:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -101,6 +140,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.send_buffer)
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
+            self._add_ip_session(client_ip, session.id)
+            self.logger.debug(f"[{client_ip}] Session {session.id} ({count+1}/{self.max_sessions_per_ip})")
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
         except Exception as e:
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
@@ -139,18 +180,14 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         raise OSError(f"Could not connect to {host}:{port}")
     
     def _handle_tcp(self, client: str, session: Session, message: bytes):
-        """TCP relay with WebSocket detection for longer read windows."""
         session.touch()
         
         if message == MSG_CLOSE:
+            self.logger.debug(f"[{client}] Session {session.id} closed")
             self.sessions.remove(session.id)
+            self._remove_ip_session(client, session.id)
             self._send(b"closed")
             return
-        
-        # Detect WebSocket upgrade in the message
-        ws_upgrade = (b"Upgrade: websocket" in message or 
-                      b"upgrade: websocket" in message or
-                      b"Upgrade: WebSocket" in message)
         
         if message and message != MSG_HEARTBEAT:
             try:
@@ -158,55 +195,44 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 session.record_sent(len(message))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 self.sessions.remove(session.id)
+                self._remove_ip_session(client, session.id)
                 self._send(b"destination_closed")
                 return
         
-        # WebSocket gets longer read window
-        rt = 0.2 if ws_upgrade else self.read_timeout
-        re = 0.3 if ws_upgrade else self.read_extend
-        
         response = b""
         try:
-            ready = select.select([session.socket], [], [], rt)
+            ready = select.select([session.socket], [], [], self.read_timeout)
             if ready[0]:
                 try:
                     chunk = session.socket.recv(self.read_chunk)
                     if not chunk:
                         self.sessions.remove(session.id)
+                        self._remove_ip_session(client, session.id)
                         self._send(b"destination_closed")
                         return
                     response = chunk
                     session.record_received(len(chunk))
-                    # Detect WebSocket frames in response
-                    if chunk and chunk[0] in (0x81, 0x82, 0x88, 0x89, 0x8A):
-                        ws_upgrade = True
-                        re = 0.3
+                    
+                    if response and len(response) < self.read_chunk:
+                        ready = select.select([session.socket], [], [], self.read_extend)
+                        if ready[0]:
+                            try:
+                                chunk = session.socket.recv(self.read_chunk)
+                                if chunk:
+                                    response += chunk
+                                    session.record_received(len(chunk))
+                            except BlockingIOError:
+                                pass
                 except BlockingIOError:
                     pass
                 except (ConnectionResetError, BrokenPipeError):
                     self.sessions.remove(session.id)
+                    self._remove_ip_session(client, session.id)
                     self._send(b"destination_closed")
                     return
-            
-            if response and len(response) < self.read_chunk:
-                deadline = time.time() + re
-                while time.time() < deadline and len(response) < self.read_chunk:
-                    ready = select.select([session.socket], [], [], 0.03)
-                    if ready[0]:
-                        try:
-                            chunk = session.socket.recv(self.read_chunk)
-                            if not chunk:
-                                break
-                            response += chunk
-                            session.record_received(len(chunk))
-                        except BlockingIOError:
-                            break
-                        except (ConnectionResetError, BrokenPipeError):
-                            break
-                    else:
-                        break
         except:
             self.sessions.remove(session.id)
+            self._remove_ip_session(client, session.id)
             self._send(b"destination_closed")
             return
         

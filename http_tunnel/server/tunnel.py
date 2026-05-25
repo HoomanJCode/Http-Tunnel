@@ -1,14 +1,21 @@
-"""Server entry point."""
+"""Server entry point - multi-threaded for concurrent connections."""
 
 import os
 import socket
 from http.server import HTTPServer
+from socketserver import ThreadingMixIn
 
 from http_tunnel.config import generate_server_config, load_and_clean_config
 from http_tunnel.logging import setup_logging
 from http_tunnel.crypto import TunnelCrypto
 from http_tunnel.server.handler import TunnelRequestHandler
 from http_tunnel.server.cleaner import SessionCleaner
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTP server that handles each request in a separate thread."""
+    daemon_threads = True
+    request_queue_size = 128
 
 
 def run_server():
@@ -35,9 +42,9 @@ def run_server():
     cleaner = SessionCleaner(TunnelRequestHandler, config["cleanup_interval"])
     cleaner.start()
     host, port = config["listen"].split(":")
-    server = HTTPServer((host, int(port)), TunnelRequestHandler)
+    server = ThreadingHTTPServer((host, int(port)), TunnelRequestHandler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    logger.info(f"Listening on {host}:{port}")
+    logger.info(f"Listening on {host}:{port} (multi-threaded, queue={server.request_queue_size})")
     logger.info(f"TCP timeout: {config['tcp_timeout']}s, UDP: {config['udp_timeout']}s")
     logger.info(f"Buffers: recv={config['recv_buffer']}, send={config['send_buffer']}")
     try:
