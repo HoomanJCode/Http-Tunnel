@@ -1,4 +1,4 @@
-"""Server entry point - multi-threaded for concurrent connections."""
+"""Server entry point."""
 
 import os
 import socket
@@ -44,9 +44,8 @@ def run_server():
     host, port = config["listen"].split(":")
     server = ThreadingHTTPServer((host, int(port)), TunnelRequestHandler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    logger.info(f"Listening on {host}:{port} (multi-threaded, queue={server.request_queue_size})")
+    logger.info(f"Listening on {host}:{port} (multi-threaded)")
     logger.info(f"TCP timeout: {config['tcp_timeout']}s, UDP: {config['udp_timeout']}s")
-    logger.info(f"Buffers: recv={config['recv_buffer']}, send={config['send_buffer']}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

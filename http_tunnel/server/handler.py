@@ -1,4 +1,4 @@
-"""HTTP request handler for tunnel server - with per-IP connection limits."""
+"""HTTP request handler for tunnel server - smart session management."""
 
 import json
 import socket
@@ -25,12 +25,9 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     read_chunk: int = 65536
     read_timeout: float = 0.01
     read_extend: float = 0.03
-    max_sessions_per_ip: int = 30
     logger = None
     
     sessions = SessionManager()
-    ip_sessions = {}  # Class-level: shared across all handler instances
-    ip_lock = threading.Lock()
     
     def handle_one_request(self):
         try:
@@ -63,7 +60,7 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     self._send(b"pong")
                     return
                 elif msg.get("type") == "connect":
-                    self._handle_connect(msg, client)
+                    self._handle_connect(msg)
                     return
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
@@ -84,51 +81,43 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.logger.error(f"Error: {e}")
     
-    @classmethod
-    def _count_ip_sessions(cls, ip: str) -> int:
-        with cls.ip_lock:
-            return len(cls.ip_sessions.get(ip, []))
+    def _cleanup_oldest_idle(self, max_remove=10):
+        """Remove oldest idle sessions to free resources."""
+        sessions = self.sessions.get_all()
+        now = time.time()
+        idle_sessions = []
+        for sid, s in sessions.items():
+            age = now - s.last_active
+            if age > 5:  # Idle for more than 5 seconds
+                idle_sessions.append((sid, age))
+        
+        # Sort by oldest first
+        idle_sessions.sort(key=lambda x: x[1], reverse=True)
+        
+        removed = 0
+        for sid, age in idle_sessions[:max_remove]:
+            try:
+                self.sessions.remove(sid)
+                removed += 1
+            except:
+                pass
+        
+        return removed
     
-    @classmethod
-    def _add_ip_session(cls, ip: str, session_id: str):
-        with cls.ip_lock:
-            if ip not in cls.ip_sessions:
-                cls.ip_sessions[ip] = []
-            cls.ip_sessions[ip].append(session_id)
-    
-    @classmethod
-    def _remove_ip_session(cls, ip: str, session_id: str):
-        with cls.ip_lock:
-            if ip in cls.ip_sessions and session_id in cls.ip_sessions[ip]:
-                cls.ip_sessions[ip].remove(session_id)
-                if not cls.ip_sessions[ip]:
-                    del cls.ip_sessions[ip]
-    
-    @classmethod
-    def _cleanup_ip_sessions(cls, ip: str):
-        with cls.ip_lock:
-            if ip in cls.ip_sessions:
-                alive = [sid for sid in cls.ip_sessions[ip] if cls.sessions.get(sid)]
-                if alive:
-                    cls.ip_sessions[ip] = alive
-                else:
-                    del cls.ip_sessions[ip]
-    
-    def _handle_connect(self, msg: dict, client_ip: str):
+    def _handle_connect(self, msg: dict):
         host = msg.get("host")
         port = msg.get("port")
         proto = msg.get("proto", PROTO_TCP)
         if not host or not port:
-            self._send(json.dumps({"status": "error", "reason": "Missing host/port"}).encode())
+            self._send(json.dumps({"status": "error"}).encode())
             return
         
-        self._cleanup_ip_sessions(client_ip)
-        count = self._count_ip_sessions(client_ip)
-        
-        if count >= self.max_sessions_per_ip:
-            self.logger.warning(f"[{client_ip}] Limit reached ({count}/{self.max_sessions_per_ip})")
-            self._send(json.dumps({"status": "error", "reason": f"Too many connections ({count})"}).encode())
-            return
+        # Clean up if we have too many sessions
+        count = self.sessions.count()
+        if count > 80:
+            removed = self._cleanup_oldest_idle(max_remove=20)
+            if removed and self.logger:
+                self.logger.debug(f"Cleaned {removed} idle sessions (was {count})")
         
         try:
             if proto == PROTO_UDP:
@@ -142,7 +131,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.send_buffer)
             session = Session.create(sock, host, port, proto)
             self.sessions.add(session)
-            self._add_ip_session(client_ip, session.id)
             self._send(json.dumps({"status": "ok", "session": session.id}).encode())
         except Exception as e:
             self._send(json.dumps({"status": "error", "reason": str(e)}).encode())
@@ -185,7 +173,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         
         if message == MSG_CLOSE:
             self.sessions.remove(session.id)
-            self._remove_ip_session(client, session.id)
             self._send(b"closed")
             return
         
@@ -195,7 +182,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 session.record_sent(len(message))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 self.sessions.remove(session.id)
-                self._remove_ip_session(client, session.id)
                 self._send(b"destination_closed")
                 return
         
@@ -207,7 +193,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     chunk = session.socket.recv(self.read_chunk)
                     if not chunk:
                         self.sessions.remove(session.id)
-                        self._remove_ip_session(client, session.id)
                         self._send(b"destination_closed")
                         return
                     response = chunk
@@ -227,12 +212,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                     pass
                 except (ConnectionResetError, BrokenPipeError):
                     self.sessions.remove(session.id)
-                    self._remove_ip_session(client, session.id)
                     self._send(b"destination_closed")
                     return
         except:
             self.sessions.remove(session.id)
-            self._remove_ip_session(client, session.id)
             self._send(b"destination_closed")
             return
         

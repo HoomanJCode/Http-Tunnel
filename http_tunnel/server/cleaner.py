@@ -17,7 +17,7 @@ class SessionCleaner(threading.Thread):
         self.logger = logging.getLogger("server.cleaner")
     
     def run(self):
-        self.logger.info(f"Cleaner started (check every 10s)")
+        self.logger.info(f"Cleaner started (every 10s)")
         while True:
             time.sleep(10)
             self._clean_stale()
@@ -38,4 +38,4 @@ class SessionCleaner(threading.Thread):
         
         if removed:
             remaining = self.handler_class.sessions.count()
-            self.logger.info(f"Cleaned {removed} stale sessions ({remaining} remaining)")
+            self.logger.info(f"Cleaned {removed} stale ({remaining} left)")
