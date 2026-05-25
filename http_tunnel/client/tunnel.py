@@ -1,4 +1,4 @@
-"""HTTP tunnel client - protocol-aware routing with HTTP/1.1 connection pool."""
+"""HTTP tunnel client - protocol-aware routing with per-thread HTTP sessions."""
 
 import socket
 import time
@@ -10,7 +10,6 @@ import ipaddress
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from http_tunnel.crypto import TunnelCrypto
 from http_tunnel.protocol import (
@@ -42,8 +41,30 @@ def is_websocket_established(first_byte: int) -> bool:
     return first_byte in (0x81, 0x82, 0x88, 0x89, 0x8A)
 
 
+class HttpSessionPool:
+    """Pool of HTTP sessions for concurrent tunnel requests."""
+    
+    def __init__(self, proxy_url=None, pool_size=20):
+        self._proxy_url = proxy_url
+        self._pool = []
+        self._lock = threading.Lock()
+        self._index = 0
+        for _ in range(pool_size):
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=0, pool_block=False)
+            session.mount('http://', adapter)
+            session.mount('https://', adapter)
+            self._pool.append(session)
+    
+    def get(self) -> requests.Session:
+        with self._lock:
+            s = self._pool[self._index % len(self._pool)]
+            self._index += 1
+            return s
+
+
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with HTTP/1.1 connection pool."""
+    """Bridges SOCKS5 to HTTP tunnel with concurrent HTTP sessions."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -54,11 +75,10 @@ class SocksToHttpTunnel:
         self.running = True
         
         self._using_proxy = False
+        self._proxy_url = None
         if self.config.get("outbound_http_proxy"):
-            self.proxies = {"http": self.config["outbound_http_proxy"], "https": self.config["outbound_http_proxy"]}
+            self._proxy_url = self.config["outbound_http_proxy"]
             self._using_proxy = True
-        else:
-            self.proxies = {}
         
         self.http_timeout = self.config["http_timeout"]
         self.heartbeat_interval = self.config["heartbeat_interval"]
@@ -74,13 +94,19 @@ class SocksToHttpTunnel:
         self.socks_host = socks_addr[0]
         self.socks_port = int(socks_addr[1])
         self.dns_mode = self.config["dns_mode"]
-        self.pool_hosts = self.config.get("pool_hosts", 10)
-        self.pool_max = self.config.get("pool_max", 30)
         self.recv_chunk = self.config.get("recv_chunk", 65536)
-        self._setup_http_session()
+        
+        # Per-thread HTTP session pool
+        pool_size = 30
+        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=pool_size)
+        
+        # Thread-local storage for session assignment
+        self._thread_sessions = {}
+        self._thread_lock = threading.Lock()
+        
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("Client ready")
+        self.logger.info(f"Client ready ({pool_size} HTTP sessions)")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -98,21 +124,23 @@ class SocksToHttpTunnel:
             except ValueError:
                 pass
     
-    def _setup_http_session(self):
-        self._session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=self.pool_hosts, pool_maxsize=self.pool_max, max_retries=0, pool_block=False)
-        self._session.mount('http://', adapter)
-        self._session.mount('https://', adapter)
+    def _get_session(self) -> requests.Session:
+        """Get or assign an HTTP session for the current thread."""
+        tid = threading.current_thread().ident
+        with self._thread_lock:
+            if tid not in self._thread_sessions:
+                self._thread_sessions[tid] = self._http_pool.get()
+            return self._thread_sessions[tid]
     
     def http_post(self, body: str, context: str = "unknown") -> str:
+        session = self._get_session()
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
+        proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
+        
         for attempt in range(2):
             try:
-                resp = self._session.post(
-                    self.server_url, data=body, headers=headers,
-                    proxies=self.proxies if self._using_proxy else None,
-                    timeout=self.http_timeout
-                )
+                resp = session.post(self.server_url, data=body, headers=headers,
+                                   proxies=proxies, timeout=self.http_timeout)
                 if resp.status_code == 502 and attempt < 1:
                     time.sleep(self.reconnect_delay)
                     continue
@@ -338,8 +366,6 @@ class SocksToHttpTunnel:
                             except:
                                 return
                             
-                            # Adaptive draining: if server sent large response,
-                            # it probably has more data. Send next request faster.
                             if len(plain) > 32768:
                                 fast_drain = True
                                 hb = 0.05
@@ -370,7 +396,7 @@ class SocksToHttpTunnel:
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
-        self.logger.info(f"Pool: {self.pool_hosts}/{self.pool_max} | TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
