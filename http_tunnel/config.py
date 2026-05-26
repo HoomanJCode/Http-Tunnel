@@ -42,8 +42,7 @@ CLIENT_CONFIG_PARAMS = {
     "recv_chunk": 65536,
     "fast_drain_threshold": 32768,
     "fast_drain_interval": 0.05,
-    "http_pool_size": 5,
-    "parallel_relay": 1,           # Max concurrent requests through proxy (0=unlimited, no queue)
+    "http_pool_size": 30,
     "log_level": "INFO"
 }
 
