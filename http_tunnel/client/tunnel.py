@@ -1,4 +1,4 @@
-"""HTTP tunnel client - protocol-aware routing with configurable parallelism."""
+"""HTTP tunnel client - protocol-aware routing with connection lifetime tracking."""
 
 import socket
 import time
@@ -24,6 +24,11 @@ from http_tunnel.client.direct import DirectConnector
 from http_tunnel.client.udp import UdpRelay
 
 
+# Suppress noisy urllib3 logs
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+logging.getLogger("urllib3.util.retry").setLevel(logging.WARNING)
+
+
 def detect_protocol_from_first_byte(first_byte: int) -> str:
     if first_byte == 0x16 or first_byte == 0x17:
         return 'tls'
@@ -42,36 +47,73 @@ def is_websocket_established(first_byte: int) -> bool:
     return first_byte in (0x81, 0x82, 0x88, 0x89, 0x8A)
 
 
-def fmt_duration(seconds: float) -> str:
-    """Format duration nicely."""
-    if seconds < 1:
-        return f"{seconds*1000:.0f}ms"
-    elif seconds < 60:
-        return f"{seconds:.1f}s"
-    elif seconds < 3600:
-        m, s = divmod(seconds, 60)
-        return f"{int(m)}m{s:.0f}s"
-    else:
-        h, remainder = divmod(seconds, 3600)
-        m, s = divmod(remainder, 60)
-        return f"{int(h)}h{int(m)}m"
-
-
-def fmt_bytes(n: int) -> str:
-    """Format bytes nicely."""
-    if n < 1024:
-        return f"{n}B"
-    elif n < 1024*1024:
-        return f"{n/1024:.1f}KB"
-    else:
-        return f"{n/(1024*1024):.1f}MB"
+class ConnectionTracker:
+    """Tracks HTTP connection lifetimes for debugging."""
+    
+    def __init__(self, logger):
+        self.logger = logger
+        self.connections = {}  # id(session) -> {'created': time, 'requests': count, 'last_used': time}
+        self.lock = threading.Lock()
+        self.total_created = 0
+        self.total_closed = 0
+        self.lifetimes = []  # Store recent lifetimes for stats
+        self.last_report = time.time()
+    
+    def created(self, session_id):
+        with self.lock:
+            self.connections[session_id] = {
+                'created': time.time(),
+                'requests': 0,
+                'last_used': time.time()
+            }
+            self.total_created += 1
+    
+    def used(self, session_id):
+        with self.lock:
+            if session_id in self.connections:
+                self.connections[session_id]['requests'] += 1
+                self.connections[session_id]['last_used'] = time.time()
+    
+    def closed(self, session_id):
+        now = time.time()
+        with self.lock:
+            if session_id in self.connections:
+                lifetime = now - self.connections[session_id]['created']
+                requests = self.connections[session_id]['requests']
+                self.lifetimes.append(lifetime)
+                if len(self.lifetimes) > 100:
+                    self.lifetimes.pop(0)
+                del self.connections[session_id]
+                self.total_closed += 1
+        
+        # Log with 5% probability for occasional insight
+        if random.random() < 0.05:
+            self._report()
+    
+    def _report(self):
+        now = time.time()
+        with self.lock:
+            active = len(self.connections)
+            if self.lifetimes:
+                avg_life = sum(self.lifetimes) / len(self.lifetimes)
+                min_life = min(self.lifetimes)
+                max_life = max(self.lifetimes)
+            else:
+                avg_life = min_life = max_life = 0
+            
+        self.logger.debug(
+            f"[ConnTracker] active={active} created={self.total_created} closed={self.total_closed} "
+            f"avg_life={avg_life:.1f}s min={min_life:.1f}s max={max_life:.1f}s"
+        )
+        self.last_report = now
 
 
 class HttpSessionPool:
-    """Pool of HTTP sessions for concurrent tunnel requests."""
+    """Pool of HTTP sessions with connection tracking."""
     
-    def __init__(self, proxy_url=None, pool_size=5):
+    def __init__(self, proxy_url=None, pool_size=30, tracker=None):
         self._proxy_url = proxy_url
+        self._tracker = tracker
         self._pool = []
         self._lock = threading.Lock()
         self._index = 0
@@ -82,66 +124,30 @@ class HttpSessionPool:
             session.mount('https://', adapter)
             self._pool.append(session)
     
-    def get(self) -> requests.Session:
+    def get(self) -> tuple:
+        """Returns (session, session_id) for tracking."""
         with self._lock:
-            s = self._pool[self._index % len(self._pool)]
+            idx = self._index % len(self._pool)
             self._index += 1
-            return s
-
-
-class ConnectionStats:
-    """Track connection lifetime statistics."""
+            return self._pool[idx], idx
     
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._lifetimes = []  # List of (seconds, reason)
-        self._max_lifetime = 0
-        self._max_target = ""
-        self._total_closed = 0
-        self._active_count = 0
-    
-    def record_open(self):
-        with self._lock:
-            self._active_count += 1
-    
-    def record_close(self, seconds: float, reason: str, target: str):
-        with self._lock:
-            self._active_count -= 1
-            self._total_closed += 1
-            self._lifetimes.append((seconds, reason, target))
-            if seconds > self._max_lifetime:
-                self._max_lifetime = seconds
-                self._max_target = target
-            # Keep only last 100 records
-            if len(self._lifetimes) > 100:
-                self._lifetimes = self._lifetimes[-100:]
-    
-    def get_stats(self) -> dict:
-        with self._lock:
-            if not self._lifetimes:
-                return None
-            recent = self._lifetimes[-20:]
-            avg = sum(t for t, _, _ in recent) / len(recent)
-            by_reason = {}
-            for _, reason, _ in recent:
-                by_reason[reason] = by_reason.get(reason, 0) + 1
-            return {
-                "active": self._active_count,
-                "total_closed": self._total_closed,
-                "avg_lifetime": avg,
-                "max_lifetime": self._max_lifetime,
-                "max_target": self._max_target,
-                "recent_reasons": by_reason,
-            }
+    def create_session(self):
+        """Create a fresh session (when old one is reset)."""
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0, pool_block=False)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with configurable parallelism."""
+    """Bridges SOCKS5 to HTTP tunnel with connection lifetime tracking."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
             raise RuntimeError("Setup cancelled.")
         self.logger = setup_logging(self.config, "client")
+        self.tracker = ConnectionTracker(self.logger)
         self.crypto = TunnelCrypto(self.config["encryption_key"])
         self.server_url = self.config["server_url"]
         self.running = True
@@ -170,27 +176,15 @@ class SocksToHttpTunnel:
         self.recv_chunk = self.config.get("recv_chunk", 65536)
         self.fast_drain_threshold = self.config.get("fast_drain_threshold", 32768)
         self.fast_drain_interval = self.config.get("fast_drain_interval", 0.05)
-        self.http_pool_size = self.config.get("http_pool_size", 5)
-        self.parallel_relay = self.config.get("parallel_relay", 1)
+        self.http_pool_size = self.config.get("http_pool_size", 30)
         
-        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size)
-        self._thread_sessions = {}
+        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size, tracker=self.tracker)
+        self._thread_sessions = {}  # tid -> (session, session_id)
         self._thread_lock = threading.Lock()
         
-        if self.parallel_relay > 0:
-            self._request_semaphore = threading.BoundedSemaphore(self.parallel_relay)
-        else:
-            self._request_semaphore = None
-        
-        self.stats = ConnectionStats()
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        
-        if self._using_proxy:
-            queue_info = f"queue={self.parallel_relay}" if self.parallel_relay > 0 else "unlimited"
-            self.logger.info(f"Client ready (proxy mode, {queue_info})")
-        else:
-            self.logger.info("Client ready (direct mode)")
+        self.logger.info("Client ready")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -208,41 +202,57 @@ class SocksToHttpTunnel:
             except ValueError:
                 pass
     
-    def _get_session(self) -> requests.Session:
+    def _get_session(self) -> tuple:
+        """Get or create HTTP session for current thread. Returns (session, session_id)."""
         tid = threading.current_thread().ident
         with self._thread_lock:
             if tid not in self._thread_sessions:
-                self._thread_sessions[tid] = self._http_pool.get()
+                session, sid = self._http_pool.get()
+                self._thread_sessions[tid] = (session, sid)
+                self.tracker.created(sid)
             return self._thread_sessions[tid]
     
+    def _replace_session(self):
+        """Replace the current thread's session (called when connection is reset)."""
+        tid = threading.current_thread().ident
+        with self._thread_lock:
+            if tid in self._thread_sessions:
+                old_session, old_sid = self._thread_sessions[tid]
+                self.tracker.closed(old_sid)
+            new_session = self._http_pool.create_session()
+            new_sid = id(new_session)
+            self._thread_sessions[tid] = (new_session, new_sid)
+            self.tracker.created(new_sid)
+    
     def http_post(self, body: str, context: str = "unknown") -> str:
-        session = self._get_session()
+        session, sid = self._get_session()
+        self.tracker.used(sid)
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
         proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
         
-        if self._request_semaphore:
-            acquired = self._request_semaphore.acquire(timeout=self.http_timeout)
-            if not acquired:
-                raise Exception("Request queue timeout")
-        
-        try:
-            for attempt in range(2):
-                try:
-                    resp = session.post(self.server_url, data=body, headers=headers,
-                                       proxies=proxies, timeout=self.http_timeout)
-                    if resp.status_code == 502 and attempt < 1:
-                        time.sleep(self.reconnect_delay)
+        for attempt in range(3):
+            try:
+                resp = session.post(self.server_url, data=body, headers=headers,
+                                   proxies=proxies, timeout=self.http_timeout)
+                if resp.status_code == 502:
+                    if attempt < 2:
+                        time.sleep(self.reconnect_delay * (2 ** attempt))
                         continue
-                    resp.raise_for_status()
-                    return resp.text
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 1:
-                        time.sleep(self.reconnect_delay)
-                        continue
-                    raise
-        finally:
-            if self._request_semaphore:
-                self._request_semaphore.release()
+                    raise Exception("Server returned 502 after retries")
+                resp.raise_for_status()
+                return resp.text
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt < 2:
+                    time.sleep(self.reconnect_delay * (2 ** attempt))
+                    continue
+                raise
+            except requests.exceptions.ChunkedEncodingError:
+                # Connection was reset mid-response - replace session
+                self._replace_session()
+                if attempt < 2:
+                    time.sleep(self.reconnect_delay * (2 ** attempt))
+                    continue
+                raise
     
     def _get_route_for_protocol(self, proto: str) -> str:
         if proto == 'tls':
@@ -289,7 +299,7 @@ class SocksToHttpTunnel:
         conn.settimeout(10)
         
         route = self._get_route_for_protocol(proto)
-        self.logger.info(f"[{thread_id}] {proto}:{target_port} → {route} {target_host}:{target_port}")
+        self.logger.info(f"[{thread_id}] {proto}:{target_port} -> {route} ({target_host}:{target_port})")
         
         if route == "direct":
             self._handle_direct(conn, target_host, target_port, thread_id, fb)
@@ -396,29 +406,19 @@ class SocksToHttpTunnel:
         hb_max = self.heartbeat_max
         bw = self.batch_wait
         
-        conn_start = time.time()
-        request_count = 0
-        bytes_sent = 0
-        bytes_recv = 0
-        close_reason = "unknown"
-        
-        self.stats.record_open()
-        
         try:
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
             resp = self.http_post(self.crypto.encrypt(connect_msg.encode()), f"{thread_id}-c")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             if resp_data.get("status") != "ok":
                 self.logger.error(f"[{thread_id}] Refused: {resp_data.get('reason','?')}")
-                close_reason = "refused"
                 return
             session_id = resp_data["session"]
             
             if first_byte:
                 self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
-                request_count += 1
             
-            self.logger.info(f"[{thread_id}] #{session_id} → {target_host}:{target_port}")
+            self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
             local_conn.setblocking(False)
             buf = b""
             last = time.time()
@@ -433,10 +433,11 @@ class SocksToHttpTunnel:
                     while True:
                         c = local_conn.recv(self.recv_chunk)
                         if not c:
-                            close_reason = "app_closed"
-                            break
+                            self.logger.info(f"[{thread_id}] Closed")
+                            if not close_sent:
+                                self._close(session_id)
+                            return
                         buf += c
-                        bytes_sent += len(c)
                         
                         if not is_websocket and is_websocket_upgrade(buf):
                             is_websocket = True
@@ -447,11 +448,9 @@ class SocksToHttpTunnel:
                 except BlockingIOError:
                     pass
                 except:
-                    close_reason = "error"
-                    break
-                
-                if close_reason != "unknown":
-                    break
+                    if not close_sent:
+                        self._close(session_id)
+                    return
                 
                 send = False
                 if len(buf) > 0:
@@ -472,29 +471,18 @@ class SocksToHttpTunnel:
                     
                     try:
                         resp_text = self.http_post(self.crypto.encrypt(create_session_message(session_id, payload)), f"{thread_id}")
-                        request_count += 1
                         plain = self.crypto.decrypt(resp_text)
                         
-                        if plain == b"destination_closed":
-                            close_reason = "remote_closed"
+                        if plain in [b"destination_closed", b"invalid_session", b"closed"]:
+                            self.logger.info(f"[{thread_id}] {plain.decode()}")
                             close_sent = True
-                            break
-                        elif plain == b"invalid_session":
-                            close_reason = "session_expired"
-                            close_sent = True
-                            break
-                        elif plain == b"closed":
-                            close_reason = "closed_ack"
-                            close_sent = True
-                            break
+                            return
                         
                         if plain:
-                            bytes_recv += len(plain)
                             try:
                                 local_conn.sendall(plain)
                             except:
-                                close_reason = "local_write_error"
-                                break
+                                return
                             
                             if len(plain) > self.fast_drain_threshold:
                                 fast_drain = True
@@ -507,44 +495,12 @@ class SocksToHttpTunnel:
                         
                         last = now
                     except Exception as e:
-                        self.logger.error(f"[{thread_id}] Req#{request_count}: {e}")
+                        self.logger.error(f"[{thread_id}] {e}")
                         time.sleep(self.reconnect_delay)
                 time.sleep(0.001)
-            
-            # Connection ended - log stats
-            lifetime = time.time() - conn_start
-            self.stats.record_close(lifetime, close_reason, f"{target_host}:{target_port}")
-            
-            self.logger.info(
-                f"[{thread_id}] #{session_id} {close_reason} | "
-                f"alive={fmt_duration(lifetime)} | "
-                f"req={request_count} | "
-                f"↑{fmt_bytes(bytes_sent)} ↓{fmt_bytes(bytes_recv)}"
-            )
-            
-            # Periodic stats announcement (~10% chance)
-            if random.random() < 0.1:
-                s = self.stats.get_stats()
-                if s:
-                    self.logger.info(
-                        f"📊 Stats: {s['active']} active, {s['total_closed']} closed | "
-                        f"avg={fmt_duration(s['avg_lifetime'])} | "
-                        f"max={fmt_duration(s['max_lifetime'])} ({s['max_target']}) | "
-                        f"recent: {s['recent_reasons']}"
-                    )
-            
-            if not close_sent and session_id:
-                self._close(session_id)
-                
         except Exception as e:
-            lifetime = time.time() - conn_start
-            close_reason = f"error:{e}"
-            self.stats.record_close(lifetime, close_reason, f"{target_host}:{target_port}")
-            self.logger.error(f"[{thread_id}] #{session_id} {close_reason} after {fmt_duration(lifetime)}")
+            self.logger.error(f"[{thread_id}] {e}")
         finally:
-            self.stats.record_close(0, "", "")  # Decrement active count if not already done
-            # Fix: only decrement if we recorded an open
-            # Actually record_open/record_close already handle this
             if session_id and not close_sent:
                 self._close(session_id)
     
@@ -555,11 +511,11 @@ class SocksToHttpTunnel:
             pass
     
     def start(self):
-        self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} → {self.server_url}")
+        self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
-            queue_info = f"queue={self.parallel_relay}" if self.parallel_relay > 0 else "unlimited"
-            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']} ({queue_info})")
-        self.logger.info(f"Routes: TLS={self.route_tls} HTTP={self.route_http} Other={self.route_other}")
+            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
+        self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"Pool:{self.http_pool_size} HB:{self.heartbeat_interval}s Drain:>{self.fast_drain_threshold}B")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
