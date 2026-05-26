@@ -1,4 +1,4 @@
-"""HTTP tunnel client - protocol-aware routing with per-thread HTTP sessions."""
+"""HTTP tunnel client - with request serialization for single-relay proxies."""
 
 import socket
 import time
@@ -44,14 +44,14 @@ def is_websocket_established(first_byte: int) -> bool:
 class HttpSessionPool:
     """Pool of HTTP sessions for concurrent tunnel requests."""
     
-    def __init__(self, proxy_url=None, pool_size=30):
+    def __init__(self, proxy_url=None, pool_size=5):
         self._proxy_url = proxy_url
         self._pool = []
         self._lock = threading.Lock()
         self._index = 0
         for _ in range(pool_size):
             session = requests.Session()
-            adapter = HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=0, pool_block=False)
+            adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0, pool_block=False)
             session.mount('http://', adapter)
             session.mount('https://', adapter)
             self._pool.append(session)
@@ -64,7 +64,7 @@ class HttpSessionPool:
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with configurable parameters."""
+    """Bridges SOCKS5 to HTTP tunnel with serialized proxy requests."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -98,11 +98,14 @@ class SocksToHttpTunnel:
         self.recv_chunk = self.config.get("recv_chunk", 65536)
         self.fast_drain_threshold = self.config.get("fast_drain_threshold", 32768)
         self.fast_drain_interval = self.config.get("fast_drain_interval", 0.05)
-        self.http_pool_size = self.config.get("http_pool_size", 30)
+        self.http_pool_size = self.config.get("http_pool_size", 5)
         
         self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size)
         self._thread_sessions = {}
         self._thread_lock = threading.Lock()
+        
+        # Request serialization for single-relay proxies
+        self._request_lock = threading.Lock() if self._using_proxy else None
         
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
@@ -136,22 +139,30 @@ class SocksToHttpTunnel:
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
         proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
         
-        for attempt in range(3):
-            try:
-                resp = session.post(self.server_url, data=body, headers=headers,
-                                   proxies=proxies, timeout=self.http_timeout)
-                if resp.status_code == 502:
-                    if attempt < 2:
-                        time.sleep(self.reconnect_delay * (2 ** attempt))
+        # Serialize requests through single-relay proxy
+        if self._request_lock:
+            acquired = self._request_lock.acquire(timeout=self.http_timeout)
+            if not acquired:
+                raise Exception("Request queue timeout")
+        
+        try:
+            for attempt in range(2):
+                try:
+                    resp = session.post(self.server_url, data=body, headers=headers,
+                                       proxies=proxies, timeout=self.http_timeout)
+                    if resp.status_code == 502 and attempt < 1:
+                        time.sleep(self.reconnect_delay)
                         continue
-                    raise Exception("Server returned 502 after retries")
-                resp.raise_for_status()
-                return resp.text
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                if attempt < 2:
-                    time.sleep(self.reconnect_delay * (2 ** attempt))
-                    continue
-                raise
+                    resp.raise_for_status()
+                    return resp.text
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    if attempt < 1:
+                        time.sleep(self.reconnect_delay)
+                        continue
+                    raise
+        finally:
+            if self._request_lock:
+                self._request_lock.release()
     
     def _get_route_for_protocol(self, proto: str) -> str:
         if proto == 'tls':
@@ -306,7 +317,6 @@ class SocksToHttpTunnel:
         bw = self.batch_wait
         
         try:
-            # Establish tunnel
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
             resp = self.http_post(self.crypto.encrypt(connect_msg.encode()), f"{thread_id}-c")
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
@@ -315,7 +325,6 @@ class SocksToHttpTunnel:
                 return
             session_id = resp_data["session"]
             
-            # Send first byte immediately if we have it
             if first_byte:
                 self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
             
@@ -324,7 +333,6 @@ class SocksToHttpTunnel:
             buf = b""
             last = time.time()
             
-            # WebSocket detection from first byte
             if first_byte and len(first_byte) > 0 and is_websocket_established(first_byte[0]):
                 is_websocket = True
                 hb_max = 30
@@ -386,7 +394,6 @@ class SocksToHttpTunnel:
                             except:
                                 return
                             
-                            # Adaptive draining based on response size
                             if len(plain) > self.fast_drain_threshold:
                                 fast_drain = True
                                 hb = self.fast_drain_interval
@@ -416,9 +423,8 @@ class SocksToHttpTunnel:
     def start(self):
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
-            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
+            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']} (serialized)")
         self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
-        self.logger.info(f"Pool:{self.http_pool_size} HB:{self.heartbeat_interval}s Drain:>{self.fast_drain_threshold}B")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
