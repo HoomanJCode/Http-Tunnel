@@ -1,4 +1,4 @@
-"""HTTP tunnel client - protocol-aware routing with connection lifetime tracking."""
+"""HTTP tunnel client - with detailed connection tracking."""
 
 import socket
 import time
@@ -8,6 +8,7 @@ import json
 import os
 import ipaddress
 import random
+import collections
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -24,7 +25,6 @@ from http_tunnel.client.direct import DirectConnector
 from http_tunnel.client.udp import UdpRelay
 
 
-# Suppress noisy urllib3 logs
 logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
 logging.getLogger("urllib3.util.retry").setLevel(logging.WARNING)
 
@@ -48,64 +48,117 @@ def is_websocket_established(first_byte: int) -> bool:
 
 
 class ConnectionTracker:
-    """Tracks HTTP connection lifetimes for debugging."""
+    """Tracks HTTP connection lifetimes and statistics."""
     
     def __init__(self, logger):
         self.logger = logger
-        self.connections = {}  # id(session) -> {'created': time, 'requests': count, 'last_used': time}
+        self.connections = {}
         self.lock = threading.Lock()
-        self.total_created = 0
-        self.total_closed = 0
-        self.lifetimes = []  # Store recent lifetimes for stats
-        self.last_report = time.time()
+        self.stats = {
+            'created': 0,
+            'closed': 0,
+            'timeouts': 0,
+            'errors': 0,
+            'active': 0,
+        }
+        self.lifetimes = collections.deque(maxlen=200)
+        self.last_log = time.time()
+        self.log_interval = 15  # Log at least every 15 seconds
     
-    def created(self, session_id):
+    def created(self, sid):
         with self.lock:
-            self.connections[session_id] = {
+            self.connections[sid] = {
                 'created': time.time(),
                 'requests': 0,
-                'last_used': time.time()
+                'last_used': time.time(),
+                'bytes_sent': 0,
+                'bytes_recv': 0,
             }
-            self.total_created += 1
+            self.stats['created'] += 1
+            self.stats['active'] = len(self.connections)
     
-    def used(self, session_id):
+    def used(self, sid, bytes_sent=0, bytes_recv=0):
         with self.lock:
-            if session_id in self.connections:
-                self.connections[session_id]['requests'] += 1
-                self.connections[session_id]['last_used'] = time.time()
+            if sid in self.connections:
+                self.connections[sid]['requests'] += 1
+                self.connections[sid]['last_used'] = time.time()
+                self.connections[sid]['bytes_sent'] += bytes_sent
+                self.connections[sid]['bytes_recv'] += bytes_recv
     
-    def closed(self, session_id):
+    def timeout(self, sid):
+        with self.lock:
+            self.stats['timeouts'] += 1
+    
+    def error(self, sid):
+        with self.lock:
+            self.stats['errors'] += 1
+    
+    def closed(self, sid):
         now = time.time()
         with self.lock:
-            if session_id in self.connections:
-                lifetime = now - self.connections[session_id]['created']
-                requests = self.connections[session_id]['requests']
+            if sid in self.connections:
+                lifetime = now - self.connections[sid]['created']
+                reqs = self.connections[sid]['requests']
+                sent = self.connections[sid]['bytes_sent']
+                recv = self.connections[sid]['bytes_recv']
                 self.lifetimes.append(lifetime)
-                if len(self.lifetimes) > 100:
-                    self.lifetimes.pop(0)
-                del self.connections[session_id]
-                self.total_closed += 1
+                del self.connections[sid]
+                self.stats['closed'] += 1
+                self.stats['active'] = len(self.connections)
         
-        # Log with 5% probability for occasional insight
-        if random.random() < 0.05:
-            self._report()
+        # Log stats periodically or randomly
+        if random.random() < 0.08 or (now - self.last_log > self.log_interval):
+            self._log_stats()
+            self.last_log = now
     
-    def _report(self):
-        now = time.time()
+    def _log_stats(self):
         with self.lock:
-            active = len(self.connections)
-            if self.lifetimes:
-                avg_life = sum(self.lifetimes) / len(self.lifetimes)
-                min_life = min(self.lifetimes)
-                max_life = max(self.lifetimes)
-            else:
-                avg_life = min_life = max_life = 0
+            active = self.stats['active']
+            created = self.stats['created']
+            closed = self.stats['closed']
+            timeouts = self.stats['timeouts']
+            errors = self.stats['errors']
             
-        self.logger.debug(
-            f"[ConnTracker] active={active} created={self.total_created} closed={self.total_closed} "
-            f"avg_life={avg_life:.1f}s min={min_life:.1f}s max={max_life:.1f}s"
+            if self.lifetimes:
+                lifetimes = list(self.lifetimes)
+                avg_life = sum(lifetimes) / len(lifetimes)
+                min_life = min(lifetimes)
+                max_life = max(lifetimes)
+                # Median
+                sorted_life = sorted(lifetimes)
+                mid = len(sorted_life) // 2
+                median_life = sorted_life[mid]
+            else:
+                avg_life = min_life = max_life = median_life = 0
+            
+            # Count connections by age
+            now = time.time()
+            age_buckets = {'<1s': 0, '1-5s': 0, '5-15s': 0, '15-30s': 0, '>30s': 0}
+            for conn in self.connections.values():
+                age = now - conn['created']
+                if age < 1:
+                    age_buckets['<1s'] += 1
+                elif age < 5:
+                    age_buckets['1-5s'] += 1
+                elif age < 15:
+                    age_buckets['5-15s'] += 1
+                elif age < 30:
+                    age_buckets['15-30s'] += 1
+                else:
+                    age_buckets['>30s'] += 1
+        
+        self.logger.info(
+            f"[Stats] active={active} created={created} closed={closed} "
+            f"timeouts={timeouts} errors={errors} | "
+            f"life: avg={avg_life:.1f}s median={median_life:.1f}s min={min_life:.1f}s max={max_life:.1f}s | "
+            f"ages: <1s={age_buckets['<1s']} 1-5s={age_buckets['1-5s']} "
+            f"5-15s={age_buckets['5-15s']} 15-30s={age_buckets['15-30s']} >30s={age_buckets['>30s']}"
         )
-        self.last_report = now
+    
+    def force_log(self):
+        """Force a stats log now."""
+        self._log_stats()
+        self.last_log = time.time()
 
 
 class HttpSessionPool:
@@ -125,14 +178,12 @@ class HttpSessionPool:
             self._pool.append(session)
     
     def get(self) -> tuple:
-        """Returns (session, session_id) for tracking."""
         with self._lock:
             idx = self._index % len(self._pool)
             self._index += 1
             return self._pool[idx], idx
     
     def create_session(self):
-        """Create a fresh session (when old one is reset)."""
         session = requests.Session()
         adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0, pool_block=False)
         session.mount('http://', adapter)
@@ -141,7 +192,7 @@ class HttpSessionPool:
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with connection lifetime tracking."""
+    """Bridges SOCKS5/HTTP proxy to HTTP tunnel with connection tracking."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -179,11 +230,19 @@ class SocksToHttpTunnel:
         self.http_pool_size = self.config.get("http_pool_size", 30)
         
         self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size, tracker=self.tracker)
-        self._thread_sessions = {}  # tid -> (session, session_id)
+        self._thread_sessions = {}
         self._thread_lock = threading.Lock()
         
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
+        
+        # Periodic stats logger
+        def stats_logger():
+            while self.running:
+                time.sleep(30)
+                self.tracker.force_log()
+        threading.Thread(target=stats_logger, daemon=True).start()
+        
         self.logger.info("Client ready")
     
     def _load_config(self, config_path: str) -> bool:
@@ -203,7 +262,6 @@ class SocksToHttpTunnel:
                 pass
     
     def _get_session(self) -> tuple:
-        """Get or create HTTP session for current thread. Returns (session, session_id)."""
         tid = threading.current_thread().ident
         with self._thread_lock:
             if tid not in self._thread_sessions:
@@ -213,7 +271,6 @@ class SocksToHttpTunnel:
             return self._thread_sessions[tid]
     
     def _replace_session(self):
-        """Replace the current thread's session (called when connection is reset)."""
         tid = threading.current_thread().ident
         with self._thread_lock:
             if tid in self._thread_sessions:
@@ -226,7 +283,6 @@ class SocksToHttpTunnel:
     
     def http_post(self, body: str, context: str = "unknown") -> str:
         session, sid = self._get_session()
-        self.tracker.used(sid)
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
         proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
         
@@ -234,6 +290,8 @@ class SocksToHttpTunnel:
             try:
                 resp = session.post(self.server_url, data=body, headers=headers,
                                    proxies=proxies, timeout=self.http_timeout)
+                self.tracker.used(sid, bytes_sent=len(body), bytes_recv=len(resp.text))
+                
                 if resp.status_code == 502:
                     if attempt < 2:
                         time.sleep(self.reconnect_delay * (2 ** attempt))
@@ -241,13 +299,14 @@ class SocksToHttpTunnel:
                     raise Exception("Server returned 502 after retries")
                 resp.raise_for_status()
                 return resp.text
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            except requests.exceptions.Timeout:
+                self.tracker.timeout(sid)
                 if attempt < 2:
                     time.sleep(self.reconnect_delay * (2 ** attempt))
                     continue
                 raise
-            except requests.exceptions.ChunkedEncodingError:
-                # Connection was reset mid-response - replace session
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError):
+                self.tracker.error(sid)
                 self._replace_session()
                 if attempt < 2:
                     time.sleep(self.reconnect_delay * (2 ** attempt))
@@ -511,12 +570,12 @@ class SocksToHttpTunnel:
             pass
     
     def start(self):
-        self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
+        self.logger.info(f"Proxy {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
-            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']}")
+            self.logger.info(f"Outbound: {self.config['outbound_http_proxy']}")
         self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"Pool:{self.http_pool_size} HB:{self.heartbeat_interval}s Drain:>{self.fast_drain_threshold}B")
-        self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
+        self.logger.info(f"curl --proxy http://127.0.0.1:{self.socks_port} https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
         try:
@@ -524,5 +583,6 @@ class SocksToHttpTunnel:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.logger.info("Shutting down...")
+            self.tracker.force_log()
             self.running = False
             s.stop()
