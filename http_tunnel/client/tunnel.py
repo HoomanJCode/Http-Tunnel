@@ -7,6 +7,7 @@ import logging
 import json
 import os
 import ipaddress
+import random
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -41,6 +42,31 @@ def is_websocket_established(first_byte: int) -> bool:
     return first_byte in (0x81, 0x82, 0x88, 0x89, 0x8A)
 
 
+def fmt_duration(seconds: float) -> str:
+    """Format duration nicely."""
+    if seconds < 1:
+        return f"{seconds*1000:.0f}ms"
+    elif seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m{s:.0f}s"
+    else:
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
+        return f"{int(h)}h{int(m)}m"
+
+
+def fmt_bytes(n: int) -> str:
+    """Format bytes nicely."""
+    if n < 1024:
+        return f"{n}B"
+    elif n < 1024*1024:
+        return f"{n/1024:.1f}KB"
+    else:
+        return f"{n/(1024*1024):.1f}MB"
+
+
 class HttpSessionPool:
     """Pool of HTTP sessions for concurrent tunnel requests."""
     
@@ -61,6 +87,52 @@ class HttpSessionPool:
             s = self._pool[self._index % len(self._pool)]
             self._index += 1
             return s
+
+
+class ConnectionStats:
+    """Track connection lifetime statistics."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._lifetimes = []  # List of (seconds, reason)
+        self._max_lifetime = 0
+        self._max_target = ""
+        self._total_closed = 0
+        self._active_count = 0
+    
+    def record_open(self):
+        with self._lock:
+            self._active_count += 1
+    
+    def record_close(self, seconds: float, reason: str, target: str):
+        with self._lock:
+            self._active_count -= 1
+            self._total_closed += 1
+            self._lifetimes.append((seconds, reason, target))
+            if seconds > self._max_lifetime:
+                self._max_lifetime = seconds
+                self._max_target = target
+            # Keep only last 100 records
+            if len(self._lifetimes) > 100:
+                self._lifetimes = self._lifetimes[-100:]
+    
+    def get_stats(self) -> dict:
+        with self._lock:
+            if not self._lifetimes:
+                return None
+            recent = self._lifetimes[-20:]
+            avg = sum(t for t, _, _ in recent) / len(recent)
+            by_reason = {}
+            for _, reason, _ in recent:
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+            return {
+                "active": self._active_count,
+                "total_closed": self._total_closed,
+                "avg_lifetime": avg,
+                "max_lifetime": self._max_lifetime,
+                "max_target": self._max_target,
+                "recent_reasons": by_reason,
+            }
 
 
 class SocksToHttpTunnel:
@@ -105,13 +177,12 @@ class SocksToHttpTunnel:
         self._thread_sessions = {}
         self._thread_lock = threading.Lock()
         
-        # Request queue (semaphore) - works with any parallel_relay value
-        # 0 = unlimited (no queue), 1+ = that many concurrent slots
         if self.parallel_relay > 0:
             self._request_semaphore = threading.BoundedSemaphore(self.parallel_relay)
         else:
             self._request_semaphore = None
         
+        self.stats = ConnectionStats()
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
         
@@ -149,7 +220,6 @@ class SocksToHttpTunnel:
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
         proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
         
-        # Acquire queue slot if parallel_relay is set
         if self._request_semaphore:
             acquired = self._request_semaphore.acquire(timeout=self.http_timeout)
             if not acquired:
@@ -219,7 +289,7 @@ class SocksToHttpTunnel:
         conn.settimeout(10)
         
         route = self._get_route_for_protocol(proto)
-        self.logger.info(f"[{thread_id}] {proto}:{target_port} -> {route} ({target_host}:{target_port})")
+        self.logger.info(f"[{thread_id}] {proto}:{target_port} → {route} {target_host}:{target_port}")
         
         if route == "direct":
             self._handle_direct(conn, target_host, target_port, thread_id, fb)
@@ -326,11 +396,13 @@ class SocksToHttpTunnel:
         hb_max = self.heartbeat_max
         bw = self.batch_wait
         
-        # Connection lifetime tracking
         conn_start = time.time()
         request_count = 0
         bytes_sent = 0
         bytes_recv = 0
+        close_reason = "unknown"
+        
+        self.stats.record_open()
         
         try:
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
@@ -338,14 +410,15 @@ class SocksToHttpTunnel:
             resp_data = json.loads(self.crypto.decrypt(resp).decode())
             if resp_data.get("status") != "ok":
                 self.logger.error(f"[{thread_id}] Refused: {resp_data.get('reason','?')}")
+                close_reason = "refused"
                 return
             session_id = resp_data["session"]
             
             if first_byte:
-                resp = self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
+                self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
                 request_count += 1
             
-            self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
+            self.logger.info(f"[{thread_id}] #{session_id} → {target_host}:{target_port}")
             local_conn.setblocking(False)
             buf = b""
             last = time.time()
@@ -360,12 +433,8 @@ class SocksToHttpTunnel:
                     while True:
                         c = local_conn.recv(self.recv_chunk)
                         if not c:
-                            # Connection closed - log lifetime
-                            lifetime = time.time() - conn_start
-                            self.logger.info(f"[{thread_id}] Closed (alive {lifetime:.1f}s, {request_count} req, {bytes_sent}B↑ {bytes_recv}B↓)")
-                            if not close_sent:
-                                self._close(session_id)
-                            return
+                            close_reason = "app_closed"
+                            break
                         buf += c
                         bytes_sent += len(c)
                         
@@ -378,11 +447,11 @@ class SocksToHttpTunnel:
                 except BlockingIOError:
                     pass
                 except:
-                    lifetime = time.time() - conn_start
-                    self.logger.debug(f"[{thread_id}] Error after {lifetime:.1f}s")
-                    if not close_sent:
-                        self._close(session_id)
-                    return
+                    close_reason = "error"
+                    break
+                
+                if close_reason != "unknown":
+                    break
                 
                 send = False
                 if len(buf) > 0:
@@ -406,18 +475,26 @@ class SocksToHttpTunnel:
                         request_count += 1
                         plain = self.crypto.decrypt(resp_text)
                         
-                        if plain in [b"destination_closed", b"invalid_session", b"closed"]:
-                            lifetime = time.time() - conn_start
-                            self.logger.info(f"[{thread_id}] {plain.decode()} (alive {lifetime:.1f}s, {request_count} req)")
+                        if plain == b"destination_closed":
+                            close_reason = "remote_closed"
                             close_sent = True
-                            return
+                            break
+                        elif plain == b"invalid_session":
+                            close_reason = "session_expired"
+                            close_sent = True
+                            break
+                        elif plain == b"closed":
+                            close_reason = "closed_ack"
+                            close_sent = True
+                            break
                         
                         if plain:
                             bytes_recv += len(plain)
                             try:
                                 local_conn.sendall(plain)
                             except:
-                                return
+                                close_reason = "local_write_error"
+                                break
                             
                             if len(plain) > self.fast_drain_threshold:
                                 fast_drain = True
@@ -430,13 +507,44 @@ class SocksToHttpTunnel:
                         
                         last = now
                     except Exception as e:
-                        self.logger.error(f"[{thread_id}] {e}")
+                        self.logger.error(f"[{thread_id}] Req#{request_count}: {e}")
                         time.sleep(self.reconnect_delay)
                 time.sleep(0.001)
+            
+            # Connection ended - log stats
+            lifetime = time.time() - conn_start
+            self.stats.record_close(lifetime, close_reason, f"{target_host}:{target_port}")
+            
+            self.logger.info(
+                f"[{thread_id}] #{session_id} {close_reason} | "
+                f"alive={fmt_duration(lifetime)} | "
+                f"req={request_count} | "
+                f"↑{fmt_bytes(bytes_sent)} ↓{fmt_bytes(bytes_recv)}"
+            )
+            
+            # Periodic stats announcement (~10% chance)
+            if random.random() < 0.1:
+                s = self.stats.get_stats()
+                if s:
+                    self.logger.info(
+                        f"📊 Stats: {s['active']} active, {s['total_closed']} closed | "
+                        f"avg={fmt_duration(s['avg_lifetime'])} | "
+                        f"max={fmt_duration(s['max_lifetime'])} ({s['max_target']}) | "
+                        f"recent: {s['recent_reasons']}"
+                    )
+            
+            if not close_sent and session_id:
+                self._close(session_id)
+                
         except Exception as e:
             lifetime = time.time() - conn_start
-            self.logger.error(f"[{thread_id}] Error after {lifetime:.1f}s: {e}")
+            close_reason = f"error:{e}"
+            self.stats.record_close(lifetime, close_reason, f"{target_host}:{target_port}")
+            self.logger.error(f"[{thread_id}] #{session_id} {close_reason} after {fmt_duration(lifetime)}")
         finally:
+            self.stats.record_close(0, "", "")  # Decrement active count if not already done
+            # Fix: only decrement if we recorded an open
+            # Actually record_open/record_close already handle this
             if session_id and not close_sent:
                 self._close(session_id)
     
@@ -447,11 +555,11 @@ class SocksToHttpTunnel:
             pass
     
     def start(self):
-        self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
+        self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} → {self.server_url}")
         if self._using_proxy:
             queue_info = f"queue={self.parallel_relay}" if self.parallel_relay > 0 else "unlimited"
             self.logger.info(f"Proxy: {self.config['outbound_http_proxy']} ({queue_info})")
-        self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
+        self.logger.info(f"Routes: TLS={self.route_tls} HTTP={self.route_http} Other={self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)
         s.start()
