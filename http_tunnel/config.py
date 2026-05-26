@@ -14,35 +14,56 @@ SERVER_CONFIG_PARAMS = {
     "udp_timeout": 120,
     "connect_timeout": 8,
     "cleanup_interval": 30,
-    "recv_buffer": 131072,       # Socket receive buffer (128KB)
-    "send_buffer": 131072,       # Socket send buffer (128KB)
-    "read_chunk": 65536,         # Max bytes per recv() call
-    "read_timeout": 0.05,        # Initial select timeout (seconds)
-    "read_extend": 0.1,          # Extension when data is flowing
+    "recv_buffer": 131072,
+    "send_buffer": 131072,
+    "read_chunk": 65536,
+    "read_timeout": 0.01,
+    "read_extend": 0.03,
     "log_level": "INFO"
 }
 
 CLIENT_CONFIG_PARAMS = {
+    # Required
     "encryption_key": _REQUIRED,
     "socks_listen": _REQUIRED,
     "server_url": _REQUIRED,
+    
+    # Proxy
     "outbound_http_proxy": "",
+    
+    # DNS
     "dns_mode": "server",
+    
+    # Timeouts
     "http_timeout": 45,
+    "connect_timeout": 8,
     "heartbeat_interval": 1,
     "heartbeat_max": 15,
     "batch_wait": 0.01,
     "reconnect_delay": 0.5,
+    
+    # Limits
     "max_post_bytes": 5242880,
-    "bypass_local": True,
-    "bypass_ranges": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+    
+    # Routing
     "route_tls": "tunnel",
     "route_http": "tunnel",
     "route_other": "tunnel",
+    
+    # Performance
     "recv_chunk": 65536,
     "fast_drain_threshold": 32768,
     "fast_drain_interval": 0.05,
     "http_pool_size": 30,
+    
+    # Bypass
+    "bypass_local": True,
+    "bypass_ranges": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+    
+    # QoS
+    "high_priority_ports": [22, 80, 443, 8080],
+    
+    # Logging
     "log_level": "INFO"
 }
 
@@ -97,18 +118,18 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     config["encryption_key"] = psk
     print("\nNetwork:")
     config["listen"] = input("Listen address [0.0.0.0:8080]: ").strip() or "0.0.0.0:8080"
-    print("\nTimeouts (Enter for defaults):")
+    print("\nTimeouts:")
     _prompt_float(config, "connect_timeout", "TCP connect timeout (s)", 8)
     _prompt_float(config, "tcp_timeout", "TCP idle timeout (s)", 60)
     _prompt_float(config, "udp_timeout", "UDP idle timeout (s)", 120)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
     _prompt_float(config, "cleanup_interval", "Cleanup interval (s)", 30)
-    print("\nSocket Buffers (Enter for defaults):")
-    _prompt_int(config, "recv_buffer", "Socket receive buffer (bytes)", 131072)
-    _prompt_int(config, "send_buffer", "Socket send buffer (bytes)", 131072)
-    _prompt_int(config, "read_chunk", "Max read chunk (bytes)", 65536)
-    _prompt_float(config, "read_timeout", "Read timeout (s)", 0.05)
-    _prompt_float(config, "read_extend", "Read extend when flowing (s)", 0.1)
+    print("\nSocket Buffers:")
+    _prompt_int(config, "recv_buffer", "Receive buffer (bytes)", 131072)
+    _prompt_int(config, "send_buffer", "Send buffer (bytes)", 131072)
+    _prompt_int(config, "read_chunk", "Read chunk (bytes)", 65536)
+    _prompt_float(config, "read_timeout", "Read timeout (s)", 0.01)
+    _prompt_float(config, "read_extend", "Read extend (s)", 0.03)
     print("\nLogging:")
     config["log_level"] = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper() or "INFO"
     config = clean_config(config, "server")
@@ -129,40 +150,49 @@ def generate_client_config(config_path: str = "client_config.json") -> bool:
         psk = secrets.token_hex(16)
         print(f"Generated: {psk}")
     config["encryption_key"] = psk
-    print("\nSOCKS5:")
+    
+    print("\nSOCKS5/HTTP Proxy:")
     config["socks_listen"] = input("Listen address [127.0.0.1:1080]: ").strip() or "127.0.0.1:1080"
+    
     print("\nServer:")
     config["server_url"] = input("Server URL [http://localhost:8080/tunnel]: ").strip() or "http://localhost:8080/tunnel"
     config["outbound_http_proxy"] = input("Outbound proxy (empty=none): ").strip()
-    print("\nDNS (server=no leaks):")
+    
+    print("\nDNS:")
     config["dns_mode"] = input("DNS mode (local/server) [server]: ").strip().lower() or "server"
+    
     print("\nRouting (direct | proxy | tunnel):")
-    route_tls = input("TLS routing [tunnel]: ").strip().lower()
-    config["route_tls"] = route_tls if route_tls in ("direct", "proxy", "tunnel") else "tunnel"
-    route_http = input("HTTP routing [tunnel]: ").strip().lower()
-    config["route_http"] = route_http if route_http in ("direct", "proxy", "tunnel") else "tunnel"
-    route_other = input("Other routing [tunnel]: ").strip().lower()
-    config["route_other"] = route_other if route_other in ("direct", "proxy", "tunnel") else "tunnel"
-    print("\nTimeouts (Enter for defaults):")
+    config["route_tls"] = input("TLS [tunnel]: ").strip().lower() or "tunnel"
+    config["route_http"] = input("HTTP [tunnel]: ").strip().lower() or "tunnel"
+    config["route_other"] = input("Other [tunnel]: ").strip().lower() or "tunnel"
+    
+    print("\nTimeouts:")
     _prompt_float(config, "connect_timeout", "TCP connect timeout (s)", 8)
     _prompt_float(config, "http_timeout", "HTTP timeout (s)", 45)
     _prompt_float(config, "heartbeat_interval", "Heartbeat (s)", 1)
+    _prompt_float(config, "heartbeat_max", "Max heartbeat backoff (s)", 15)
     _prompt_float(config, "batch_wait", "Batch wait (s, 0=instant)", 0.01)
     _prompt_float(config, "reconnect_delay", "Reconnect delay (s)", 0.5)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
-    print("\nConnection Pool (Enter for defaults):")
-    _prompt_int(config, "pool_hosts", "Pool hosts", 10)
-    _prompt_int(config, "pool_max", "Pool max connections", 30)
-    _prompt_int(config, "recv_chunk", "Recv chunk size (bytes)", 65536)
+    
+    print("\nPerformance:")
+    _prompt_int(config, "recv_chunk", "Recv chunk (bytes)", 65536)
+    _prompt_int(config, "fast_drain_threshold", "Fast drain threshold (bytes)", 32768)
+    _prompt_float(config, "fast_drain_interval", "Fast drain interval (s)", 0.05)
+    _prompt_int(config, "http_pool_size", "HTTP session pool size", 30)
+    
     print("\nBypass:")
     config["bypass_local"] = input("Bypass localhost? (Y/n) [Y]: ").strip().lower() != 'n'
     bypass_input = input("Bypass CIDRs (comma, Enter=defaults): ").strip()
     config["bypass_ranges"] = [r.strip() for r in bypass_input.split(",")] if bypass_input else ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-    print("\nQoS (lower batch wait for these ports):")
+    
+    print("\nQoS:")
     qos_input = input("Priority ports (comma, Enter=defaults): ").strip()
     config["high_priority_ports"] = [int(p.strip()) for p in qos_input.split(",")] if qos_input else [22, 80, 443, 8080]
+    
     print("\nLogging:")
     config["log_level"] = input("Log level (DEBUG/INFO/WARNING/ERROR) [INFO]: ").strip().upper() or "INFO"
+    
     config = clean_config(config, "client")
     save_config(config_path, config)
     print(f"\nSaved: {config_path}")
