@@ -1,4 +1,4 @@
-"""HTTP tunnel client - with request serialization for single-relay proxies."""
+"""HTTP tunnel client - protocol-aware routing with configurable parallelism."""
 
 import socket
 import time
@@ -64,7 +64,7 @@ class HttpSessionPool:
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5 to HTTP tunnel with serialized proxy requests."""
+    """Bridges SOCKS5 to HTTP tunnel with configurable parallelism."""
     
     def __init__(self, config_path: str = "client_config.json"):
         if not self._load_config(config_path):
@@ -99,17 +99,27 @@ class SocksToHttpTunnel:
         self.fast_drain_threshold = self.config.get("fast_drain_threshold", 32768)
         self.fast_drain_interval = self.config.get("fast_drain_interval", 0.05)
         self.http_pool_size = self.config.get("http_pool_size", 5)
+        self.parallel_relay = self.config.get("parallel_relay", 1)
         
         self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size)
         self._thread_sessions = {}
         self._thread_lock = threading.Lock()
         
-        # Request serialization for single-relay proxies
-        self._request_lock = threading.Lock() if self._using_proxy else None
+        # Request queue (semaphore) - works with any parallel_relay value
+        # 0 = unlimited (no queue), 1+ = that many concurrent slots
+        if self.parallel_relay > 0:
+            self._request_semaphore = threading.BoundedSemaphore(self.parallel_relay)
+        else:
+            self._request_semaphore = None
         
         self.direct = DirectConnector(self)
         self.udp = UdpRelay(self)
-        self.logger.info("Client ready")
+        
+        if self._using_proxy:
+            queue_info = f"queue={self.parallel_relay}" if self.parallel_relay > 0 else "unlimited"
+            self.logger.info(f"Client ready (proxy mode, {queue_info})")
+        else:
+            self.logger.info("Client ready (direct mode)")
     
     def _load_config(self, config_path: str) -> bool:
         if not os.path.exists(config_path):
@@ -139,9 +149,9 @@ class SocksToHttpTunnel:
         headers = {"Content-Type": "text/plain", "Connection": "keep-alive"}
         proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._using_proxy else None
         
-        # Serialize requests through single-relay proxy
-        if self._request_lock:
-            acquired = self._request_lock.acquire(timeout=self.http_timeout)
+        # Acquire queue slot if parallel_relay is set
+        if self._request_semaphore:
+            acquired = self._request_semaphore.acquire(timeout=self.http_timeout)
             if not acquired:
                 raise Exception("Request queue timeout")
         
@@ -161,8 +171,8 @@ class SocksToHttpTunnel:
                         continue
                     raise
         finally:
-            if self._request_lock:
-                self._request_lock.release()
+            if self._request_semaphore:
+                self._request_semaphore.release()
     
     def _get_route_for_protocol(self, proto: str) -> str:
         if proto == 'tls':
@@ -316,6 +326,12 @@ class SocksToHttpTunnel:
         hb_max = self.heartbeat_max
         bw = self.batch_wait
         
+        # Connection lifetime tracking
+        conn_start = time.time()
+        request_count = 0
+        bytes_sent = 0
+        bytes_recv = 0
+        
         try:
             connect_msg = create_connect_message(target_host, target_port, PROTO_TCP)
             resp = self.http_post(self.crypto.encrypt(connect_msg.encode()), f"{thread_id}-c")
@@ -326,7 +342,8 @@ class SocksToHttpTunnel:
             session_id = resp_data["session"]
             
             if first_byte:
-                self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
+                resp = self.http_post(self.crypto.encrypt(create_session_message(session_id, first_byte)), f"{thread_id}-d0")
+                request_count += 1
             
             self.logger.info(f"[{thread_id}] {session_id} -> {target_host}:{target_port}")
             local_conn.setblocking(False)
@@ -343,11 +360,14 @@ class SocksToHttpTunnel:
                     while True:
                         c = local_conn.recv(self.recv_chunk)
                         if not c:
-                            self.logger.info(f"[{thread_id}] Closed")
+                            # Connection closed - log lifetime
+                            lifetime = time.time() - conn_start
+                            self.logger.info(f"[{thread_id}] Closed (alive {lifetime:.1f}s, {request_count} req, {bytes_sent}B↑ {bytes_recv}B↓)")
                             if not close_sent:
                                 self._close(session_id)
                             return
                         buf += c
+                        bytes_sent += len(c)
                         
                         if not is_websocket and is_websocket_upgrade(buf):
                             is_websocket = True
@@ -358,6 +378,8 @@ class SocksToHttpTunnel:
                 except BlockingIOError:
                     pass
                 except:
+                    lifetime = time.time() - conn_start
+                    self.logger.debug(f"[{thread_id}] Error after {lifetime:.1f}s")
                     if not close_sent:
                         self._close(session_id)
                     return
@@ -381,14 +403,17 @@ class SocksToHttpTunnel:
                     
                     try:
                         resp_text = self.http_post(self.crypto.encrypt(create_session_message(session_id, payload)), f"{thread_id}")
+                        request_count += 1
                         plain = self.crypto.decrypt(resp_text)
                         
                         if plain in [b"destination_closed", b"invalid_session", b"closed"]:
-                            self.logger.info(f"[{thread_id}] {plain.decode()}")
+                            lifetime = time.time() - conn_start
+                            self.logger.info(f"[{thread_id}] {plain.decode()} (alive {lifetime:.1f}s, {request_count} req)")
                             close_sent = True
                             return
                         
                         if plain:
+                            bytes_recv += len(plain)
                             try:
                                 local_conn.sendall(plain)
                             except:
@@ -409,7 +434,8 @@ class SocksToHttpTunnel:
                         time.sleep(self.reconnect_delay)
                 time.sleep(0.001)
         except Exception as e:
-            self.logger.error(f"[{thread_id}] {e}")
+            lifetime = time.time() - conn_start
+            self.logger.error(f"[{thread_id}] Error after {lifetime:.1f}s: {e}")
         finally:
             if session_id and not close_sent:
                 self._close(session_id)
@@ -423,7 +449,8 @@ class SocksToHttpTunnel:
     def start(self):
         self.logger.info(f"SOCKS5 {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
-            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']} (serialized)")
+            queue_info = f"queue={self.parallel_relay}" if self.parallel_relay > 0 else "unlimited"
+            self.logger.info(f"Proxy: {self.config['outbound_http_proxy']} ({queue_info})")
         self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"curl --socks5-hostname 127.0.0.1:{self.socks_port} --ipv4 https://example.com")
         s = Socks5Server(self.socks_host, self.socks_port, self.handle_connection)

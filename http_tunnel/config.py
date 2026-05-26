@@ -23,17 +23,14 @@ SERVER_CONFIG_PARAMS = {
 }
 
 CLIENT_CONFIG_PARAMS = {
-    # Required
     "encryption_key": _REQUIRED,
     "socks_listen": _REQUIRED,
     "server_url": _REQUIRED,
-    
-    # Optional
     "outbound_http_proxy": "",
     "dns_mode": "server",
     "http_timeout": 45,
     "heartbeat_interval": 1,
-    "heartbeat_max": 15,           # Max heartbeat backoff
+    "heartbeat_max": 15,
     "batch_wait": 0.01,
     "reconnect_delay": 0.5,
     "max_post_bytes": 5242880,
@@ -43,9 +40,10 @@ CLIENT_CONFIG_PARAMS = {
     "route_http": "tunnel",
     "route_other": "tunnel",
     "recv_chunk": 65536,
-    "fast_drain_threshold": 32768,  # Response size that triggers fast drain
-    "fast_drain_interval": 0.05,    # Fast drain polling interval
-    "http_pool_size": 30,           # HTTP session pool size
+    "fast_drain_threshold": 32768,
+    "fast_drain_interval": 0.05,
+    "http_pool_size": 5,
+    "parallel_relay": 1,           # Max concurrent requests through proxy (0=unlimited, no queue)
     "log_level": "INFO"
 }
 
