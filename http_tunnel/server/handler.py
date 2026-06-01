@@ -221,6 +221,10 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         
         self._send(response if response else b"")
     
+class TunnelRequestHandler(BaseHTTPRequestHandler):
+    # ... existing variables ...
+    udp_read_timeout: float = 0.3
+    
     def _handle_udp(self, client: str, session: Session, data: bytes):
         session.touch()
         if data and data not in [MSG_CLOSE, MSG_HEARTBEAT]:
@@ -229,12 +233,14 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
                 session.record_sent(len(data))
             except:
                 pass
+        
         response = b""
         try:
-            ready = select.select([session.socket], [], [], 0.001)
+            ready = select.select([session.socket], [], [], self.udp_read_timeout)
             if ready[0]:
                 data, addr = session.socket.recvfrom(65536)
                 response = data
+                session.record_received(len(data))
         except:
             pass
         self._send(response if response else b"")

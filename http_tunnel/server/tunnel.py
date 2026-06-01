@@ -39,6 +39,7 @@ def run_server():
     TunnelRequestHandler.read_chunk = config["read_chunk"]
     TunnelRequestHandler.read_timeout = config["read_timeout"]
     TunnelRequestHandler.read_extend = config["read_extend"]
+    TunnelRequestHandler.udp_read_timeout = config["udp_read_timeout"]
     cleaner = SessionCleaner(TunnelRequestHandler, config["cleanup_interval"])
     cleaner.start()
     host, port = config["listen"].split(":")

@@ -19,6 +19,7 @@ SERVER_CONFIG_PARAMS = {
     "read_chunk": 65536,
     "read_timeout": 0.01,
     "read_extend": 0.03,
+    "udp_read_timeout": 0.3,       # UDP response wait time
     "log_level": "INFO"
 }
 
@@ -124,6 +125,7 @@ def generate_server_config(config_path: str = "server_config.json") -> bool:
     _prompt_float(config, "udp_timeout", "UDP idle timeout (s)", 120)
     _prompt_int(config, "max_post_bytes", "Max POST bytes", 5242880)
     _prompt_float(config, "cleanup_interval", "Cleanup interval (s)", 30)
+    _prompt_float(config, "udp_read_timeout", "UDP read timeout (s)", 0.3)
     print("\nSocket Buffers:")
     _prompt_int(config, "recv_buffer", "Receive buffer (bytes)", 131072)
     _prompt_int(config, "send_buffer", "Send buffer (bytes)", 131072)
