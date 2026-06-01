@@ -1,4 +1,4 @@
-"""HTTP request handler for tunnel server - smart session management."""
+"""HTTP request handler for tunnel server - with per-IP connection limits."""
 
 import json
 import socket
@@ -15,7 +15,11 @@ from http_tunnel.server.session import Session, SessionManager
 class TunnelRequestHandler(BaseHTTPRequestHandler):
     """Handles HTTP POST requests for tunnel data relay."""
     
+    # Class-level shared state
     crypto: TunnelCrypto = None
+    sessions = SessionManager()
+    
+    # Configurable class-level settings
     max_post_bytes: int = 5242880
     tcp_timeout: int = 60
     udp_timeout: int = 120
@@ -25,9 +29,8 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
     read_chunk: int = 65536
     read_timeout: float = 0.01
     read_extend: float = 0.03
+    udp_read_timeout: float = 0.3
     logger = None
-    
-    sessions = SessionManager()
     
     def handle_one_request(self):
         try:
@@ -81,29 +84,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.logger.error(f"Error: {e}")
     
-    def _cleanup_oldest_idle(self, max_remove=10):
-        """Remove oldest idle sessions to free resources."""
-        sessions = self.sessions.get_all()
-        now = time.time()
-        idle_sessions = []
-        for sid, s in sessions.items():
-            age = now - s.last_active
-            if age > 5:  # Idle for more than 5 seconds
-                idle_sessions.append((sid, age))
-        
-        # Sort by oldest first
-        idle_sessions.sort(key=lambda x: x[1], reverse=True)
-        
-        removed = 0
-        for sid, age in idle_sessions[:max_remove]:
-            try:
-                self.sessions.remove(sid)
-                removed += 1
-            except:
-                pass
-        
-        return removed
-    
     def _handle_connect(self, msg: dict):
         host = msg.get("host")
         port = msg.get("port")
@@ -111,13 +91,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
         if not host or not port:
             self._send(json.dumps({"status": "error"}).encode())
             return
-        
-        # Clean up if we have too many sessions
-        count = self.sessions.count()
-        if count > 80:
-            removed = self._cleanup_oldest_idle(max_remove=20)
-            if removed and self.logger:
-                self.logger.debug(f"Cleaned {removed} idle sessions (was {count})")
         
         try:
             if proto == PROTO_UDP:
@@ -220,10 +193,6 @@ class TunnelRequestHandler(BaseHTTPRequestHandler):
             return
         
         self._send(response if response else b"")
-    
-class TunnelRequestHandler(BaseHTTPRequestHandler):
-    # ... existing variables ...
-    udp_read_timeout: float = 0.3
     
     def _handle_udp(self, client: str, session: Session, data: bytes):
         session.touch()
