@@ -60,35 +60,62 @@ jobs:
           echo "=========================================="
           echo "  HTTP Tunnel Server Deployment"
           echo "=========================================="
+          echo "  Server: $(hostname)"
+          echo "  Time:   $(date)"
+          echo "=========================================="
+          echo ""
 
-          # Install required tools
-          echo "📦 Installing dependencies..."
+          # ─── Disk Space Check ─────────────────────────
+          echo "[1/7] 💾 Checking disk space..."
+          AVAILABLE=$(df -BG /opt 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
+          if [ -n "$AVAILABLE" ] && [ "$AVAILABLE" -lt 1 ]; then
+              echo "❌ Less than 1GB disk space ($AVAILABLE GB). Aborting."
+              exit 1
+          fi
+          echo "  ✅ Disk space OK ($AVAILABLE GB available)"
+
+          # ─── Install Dependencies ─────────────────────
+          echo "[2/7] 📦 Installing packages..."
+          export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
-          apt-get install -y -qq python3 python3-pip python3-venv git curl
+          apt-get install -y -qq python3 python3-pip python3-venv git curl 2>&1 | tail -1
 
-          # Stop existing service
-          if systemctl is-active --quiet $SERVICE_NAME; then
-            echo "⏹️  Stopping $SERVICE_NAME..."
-            systemctl stop $SERVICE_NAME
-            sleep 3
-          fi
-
-          # Deploy code (public repo - no token needed)
-          if [ -d "$PROJECT_DIR/.git" ]; then
-            echo "📥 Pulling latest code..."
-            cd "$PROJECT_DIR"
-            git fetch origin
-            git reset --hard origin/master
-            git clean -fd -e ".env" -e "*.log"
+          # ─── Create User ──────────────────────────────
+          echo "[3/7] 👤 Creating service user..."
+          if ! id -u tunnel > /dev/null 2>&1; then
+              useradd -r -s /usr/sbin/nologin -d /nonexistent -M tunnel
+              echo "  ✅ User 'tunnel' created"
           else
-            echo "📥 Cloning repository..."
-            rm -rf "$PROJECT_DIR"
-            git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR"
-            cd "$PROJECT_DIR"
+              echo "  ✅ User 'tunnel' exists"
           fi
 
-          # Patch server to use .env
-          echo "🔧 Patching server to use .env..."
+          # ─── Stop Service ─────────────────────────────
+          if systemctl is-active --quiet $SERVICE_NAME; then
+              echo "⏹️  Stopping $SERVICE_NAME..."
+              systemctl stop $SERVICE_NAME
+              sleep 2
+          fi
+
+          # ─── Fix Git Ownership ────────────────────────
+          git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
+
+          # ─── Deploy Code ──────────────────────────────
+          echo "[4/7] 📥 Deploying code..."
+          if [ -d "$PROJECT_DIR/.git" ]; then
+              cd "$PROJECT_DIR"
+              git fetch origin --quiet
+              git reset --hard origin/master --quiet
+              git clean -fd -e ".env" -e "*.log" --quiet
+              echo "  ✅ Code updated"
+          else
+              mkdir -p "$PROJECT_DIR"
+              git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR" --quiet
+              cd "$PROJECT_DIR"
+              echo "  ✅ Code cloned"
+          fi
+
+          # ─── Patch Server for .env ────────────────────
+          echo "[5/7] 🔧 Patching server to use .env..."
           cat > "$PROJECT_DIR/http_tunnel/server/tunnel.py" << 'TUNNELPY'
           """Server entry point - uses .env configuration."""
           
@@ -111,14 +138,11 @@ jobs:
 
           def run_server():
               config = SERVER_CONFIG
-              
               if not config.get('encryption_key'):
                   print("ENCRYPTION_KEY not set in .env")
                   return
-              
               logger = setup_logging(config, "server")
               logger.info("Starting server...")
-              
               TunnelRequestHandler.logger = logger
               TunnelRequestHandler.crypto = TunnelCrypto(config['encryption_key'])
               TunnelRequestHandler.max_post_bytes = int(config['max_post_bytes'])
@@ -131,17 +155,13 @@ jobs:
               TunnelRequestHandler.read_timeout = float(config['read_timeout'])
               TunnelRequestHandler.read_extend = float(config['read_extend'])
               TunnelRequestHandler.udp_read_timeout = float(config['udp_read_timeout'])
-              
               cleaner = SessionCleaner(TunnelRequestHandler, float(config['cleanup_interval']))
               cleaner.start()
-              
               host = config['listen_host']
               port = int(config['listen_port'])
               server = ThreadingHTTPServer((host, port), TunnelRequestHandler)
               server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-              
               logger.info(f"Listening on {host}:{port}")
-              
               try:
                   server.serve_forever()
               except KeyboardInterrupt:
@@ -149,10 +169,8 @@ jobs:
                   server.shutdown()
           TUNNELPY
 
-          # Patch config.py
           cat > "$PROJECT_DIR/http_tunnel/config.py" << 'CONFIGPY'
           """Configuration via .env file."""
-          
           import os
           import secrets
           from pathlib import Path
@@ -168,42 +186,23 @@ jobs:
                           if key and val:
                               os.environ[key] = val
 
-
           def _env(key, default=None, cast=str):
               val = os.getenv(key)
-              if val is None:
-                  return default
-              try:
-                  return cast(val)
-              except (ValueError, TypeError):
-                  return default
+              if val is None: return default
+              try: return cast(val)
+              except (ValueError, TypeError): return default
 
-
-          def _env_int(key, default):
-              return _env(key, default, int)
-
-
-          def _env_float(key, default):
-              return _env(key, default, float)
-
-
+          def _env_int(key, default): return _env(key, default, int)
+          def _env_float(key, default): return _env(key, default, float)
           def _env_bool(key, default):
               val = os.getenv(key)
-              if val is None:
-                  return default
+              if val is None: return default
               return val.lower() in ('true', '1', 'yes', 'y', 'on')
-
-
           def _env_list(key, default, cast=str):
               val = os.getenv(key)
-              if val is None:
-                  return default
+              if val is None: return default
               return [cast(x.strip()) for x in val.split(',') if x.strip()]
-
-
-          def _env_int_list(key, default):
-              return _env_list(key, default, int)
-
+          def _env_int_list(key, default): return _env_list(key, default, int)
 
           SERVER_CONFIG = {
               'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
@@ -222,7 +221,6 @@ jobs:
               'udp_read_timeout': _env_float('UDP_READ_TIMEOUT', 0.3),
               'log_level': _env('LOG_LEVEL', 'INFO').upper(),
           }
-
 
           CLIENT_CONFIG = {
               'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
@@ -246,16 +244,15 @@ jobs:
               'fast_drain_interval': _env_float('FAST_DRAIN_INTERVAL', 0.05),
               'http_pool_size': _env_int('HTTP_POOL_SIZE', 30),
               'bypass_local': _env_bool('BYPASS_LOCAL', True),
-              'bypass_ranges': _env_list('BYPASS_RANGES', [
-                  '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'
-              ]),
+              'bypass_ranges': _env_list('BYPASS_RANGES', ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']),
               'high_priority_ports': _env_int_list('HIGH_PRIORITY_PORTS', [22, 80, 443, 8080]),
               'log_level': _env('LOG_LEVEL', 'INFO').upper(),
           }
           CONFIGPY
+          echo "  ✅ Server patched"
 
-          # Create .env
-          echo "⚙️  Creating .env..."
+          # ─── Create .env ──────────────────────────────
+          echo "[6/7] ⚙️  Creating .env..."
           cat > "$PROJECT_DIR/.env" << ENVEOF
           ENCRYPTION_KEY=ENCRYPTION_KEY_PLACEHOLDER
           LISTEN_HOST=LISTEN_HOST_PLACEHOLDER
@@ -274,36 +271,30 @@ jobs:
           LOG_LEVEL=LOG_LEVEL_PLACEHOLDER
           ENVEOF
           chmod 600 "$PROJECT_DIR/.env"
-          chown -R tunnel:tunnel "$PROJECT_DIR" 2>/dev/null || true
+          echo "  ✅ .env created"
 
-          # Setup Python
-          echo "🐍 Setting up Python..."
+          # ─── Python & Service ─────────────────────────
+          echo "[7/7] 🐍 Setting up Python & service..."
           cd "$PROJECT_DIR"
-          [ -d venv ] && rm -rf venv
+          rm -rf venv
           python3 -m venv venv
-          $PROJECT_DIR/venv/bin/pip install --upgrade pip -q
-          $PROJECT_DIR/venv/bin/pip install -r requirements.txt -q
+          "$PROJECT_DIR/venv/bin/pip" install --upgrade pip -q 2>&1 | tail -1
+          "$PROJECT_DIR/venv/bin/pip" install -r requirements.txt -q 2>&1 | tail -1
 
-          # Validate
-          echo "🧪 Testing imports..."
-          $PROJECT_DIR/venv/bin/python -c "
+          "$PROJECT_DIR/venv/bin/python" -c "
           import sys; sys.path.insert(0, '$PROJECT_DIR')
           from http_tunnel.server.tunnel import run_server
-          print('✅ Modules loaded')
+          print('  ✅ Modules loaded')
           "
 
-          # Create user if not exists
-          id -u tunnel > /dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /nonexistent -M tunnel
           chown -R tunnel:tunnel "$PROJECT_DIR"
 
           # Firewall
-          echo "🔥 Opening port..."
           ufw status | grep -q "LISTEN_PORT_PLACEHOLDER/tcp" || {
-            ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
+              ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
           }
 
-          # Systemd service
-          echo "🔧 Creating service..."
+          # Systemd
           cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
           [Unit]
           Description=HTTP Tunnel Server
@@ -331,7 +322,7 @@ jobs:
           SERVICEEOF
 
           systemctl daemon-reload
-          systemctl enable $SERVICE_NAME
+          systemctl enable $SERVICE_NAME --quiet
 
           # Start
           echo "▶️  Starting..."
@@ -339,19 +330,20 @@ jobs:
           sleep 4
 
           if systemctl is-active --quiet $SERVICE_NAME; then
-            echo "✅ RUNNING"
-            systemctl status $SERVICE_NAME --no-pager -l
-            echo "📊 Logs:"
-            tail -10 /var/log/$SERVICE_NAME.log 2>/dev/null || true
+              echo "✅ RUNNING on LISTEN_HOST_PLACEHOLDER:LISTEN_PORT_PLACEHOLDER"
+              systemctl status $SERVICE_NAME --no-pager -l
+              echo ""
+              echo "📊 Recent logs:"
+              tail -10 /var/log/$SERVICE_NAME.log 2>/dev/null || echo "  (logs will appear here)"
           else
-            echo "❌ FAILED"
-            tail -30 /var/log/$SERVICE_NAME.log 2>/dev/null || true
-            journalctl -u $SERVICE_NAME -n 30 --no-pager || true
-            exit 1
+              echo "❌ FAILED"
+              tail -30 /var/log/$SERVICE_NAME.log 2>/dev/null || true
+              journalctl -u $SERVICE_NAME -n 30 --no-pager || true
+              exit 1
           fi
           SCRIPTEOF
 
-          # Replace all placeholders with actual values
+          # Replace placeholders
           sed -i "s|PROJECT_DIR_PLACEHOLDER|${{ env.PROJECT_DIR }}|g" /tmp/deploy_script.sh
           sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/deploy_script.sh
           sed -i "s|ENCRYPTION_KEY_PLACEHOLDER|${ENCRYPTION_KEY}|g" /tmp/deploy_script.sh
@@ -370,6 +362,6 @@ jobs:
           sed -i "s|MAX_POST_BYTES_PLACEHOLDER|${MAX_POST_BYTES}|g" /tmp/deploy_script.sh
           sed -i "s|LOG_LEVEL_PLACEHOLDER|${LOG_LEVEL}|g" /tmp/deploy_script.sh
 
-          # Upload and execute
-          scp /tmp/deploy_script.sh ${{ secrets.VPS_USER || 'root' }}@${{ secrets.VPS_HOST }}:/tmp/deploy_script.sh
-          ssh ${{ secrets.VPS_USER || 'root' }}@${{ secrets.VPS_HOST }} "bash /tmp/deploy_script.sh"
+          # Upload and run
+          scp -o StrictHostKeyChecking=accept-new -P ${{ secrets.VPS_PORT || '22' }} /tmp/deploy_script.sh ${{ secrets.VPS_USER || 'root' }}@${{ secrets.VPS_HOST }}:/tmp/deploy_script.sh
+          ssh -o StrictHostKeyChecking=accept-new -p ${{ secrets.VPS_PORT || '22' }} ${{ secrets.VPS_USER || 'root' }}@${{ secrets.VPS_HOST }} "bash /tmp/deploy_script.sh"
