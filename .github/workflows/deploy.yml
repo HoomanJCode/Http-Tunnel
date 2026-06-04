@@ -2,28 +2,39 @@ name: Deploy HTTP Tunnel Server
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
   workflow_dispatch:
+
+env:
+  PROJECT_DIR: /opt/http-tunnel
+  SERVICE_NAME: http-tunnel-server
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    name: 🚀 Deploy to VPS
 
-      - uses: webfactory/ssh-agent@v0.9.0
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
 
-      - name: Deploy
+      - name: 🔗 Add host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: 🚀 Deploy to VPS
         env:
-          # Required secrets
           VPS_HOST: ${{ secrets.VPS_HOST }}
-          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-          
-          # Optional secrets (defaults used if not set)
           VPS_USER: ${{ secrets.VPS_USER || 'root' }}
           VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           LISTEN_HOST: ${{ secrets.LISTEN_HOST || '0.0.0.0' }}
           LISTEN_PORT: ${{ secrets.LISTEN_PORT || '8080' }}
           TCP_TIMEOUT: ${{ secrets.TCP_TIMEOUT || '60' }}
@@ -38,4 +49,327 @@ jobs:
           UDP_READ_TIMEOUT: ${{ secrets.UDP_READ_TIMEOUT || '0.3' }}
           MAX_POST_BYTES: ${{ secrets.MAX_POST_BYTES || '5242880' }}
           LOG_LEVEL: ${{ secrets.LOG_LEVEL || 'INFO' }}
-        run: python3 deploy.py
+        run: |
+          cat > /tmp/deploy_script.sh << 'SCRIPTEOF'
+          #!/bin/bash
+          set -e
+
+          PROJECT_DIR="PROJECT_DIR_PLACEHOLDER"
+          SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
+
+          echo "=========================================="
+          echo "  HTTP Tunnel Server Deployment"
+          echo "=========================================="
+
+          # Install required tools
+          echo "📦 Installing dependencies..."
+          apt-get update -qq
+          apt-get install -y -qq python3 python3-pip python3-venv git curl
+
+          # Stop existing service
+          if systemctl is-active --quiet $SERVICE_NAME; then
+            echo "⏹️  Stopping $SERVICE_NAME..."
+            systemctl stop $SERVICE_NAME
+            sleep 3
+          fi
+
+          # Deploy code (public repo - no token needed)
+          if [ -d "$PROJECT_DIR/.git" ]; then
+            echo "📥 Pulling latest code..."
+            cd "$PROJECT_DIR"
+            git fetch origin
+            git reset --hard origin/master
+            git clean -fd -e ".env" -e "*.log"
+          else
+            echo "📥 Cloning repository..."
+            rm -rf "$PROJECT_DIR"
+            git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR"
+            cd "$PROJECT_DIR"
+          fi
+
+          # Patch server to use .env
+          echo "🔧 Patching server to use .env..."
+          cat > "$PROJECT_DIR/http_tunnel/server/tunnel.py" << 'TUNNELPY'
+          """Server entry point - uses .env configuration."""
+          
+          import os
+          import socket
+          from http.server import HTTPServer
+          from socketserver import ThreadingMixIn
+
+          from http_tunnel.config import SERVER_CONFIG
+          from http_tunnel.logging import setup_logging
+          from http_tunnel.crypto import TunnelCrypto
+          from http_tunnel.server.handler import TunnelRequestHandler
+          from http_tunnel.server.cleaner import SessionCleaner
+
+
+          class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+              daemon_threads = True
+              request_queue_size = 128
+
+
+          def run_server():
+              config = SERVER_CONFIG
+              
+              if not config.get('encryption_key'):
+                  print("ENCRYPTION_KEY not set in .env")
+                  return
+              
+              logger = setup_logging(config, "server")
+              logger.info("Starting server...")
+              
+              TunnelRequestHandler.logger = logger
+              TunnelRequestHandler.crypto = TunnelCrypto(config['encryption_key'])
+              TunnelRequestHandler.max_post_bytes = int(config['max_post_bytes'])
+              TunnelRequestHandler.tcp_timeout = float(config['tcp_timeout'])
+              TunnelRequestHandler.udp_timeout = float(config['udp_timeout'])
+              TunnelRequestHandler.connect_timeout = float(config['connect_timeout'])
+              TunnelRequestHandler.recv_buffer = int(config['recv_buffer'])
+              TunnelRequestHandler.send_buffer = int(config['send_buffer'])
+              TunnelRequestHandler.read_chunk = int(config['read_chunk'])
+              TunnelRequestHandler.read_timeout = float(config['read_timeout'])
+              TunnelRequestHandler.read_extend = float(config['read_extend'])
+              TunnelRequestHandler.udp_read_timeout = float(config['udp_read_timeout'])
+              
+              cleaner = SessionCleaner(TunnelRequestHandler, float(config['cleanup_interval']))
+              cleaner.start()
+              
+              host = config['listen_host']
+              port = int(config['listen_port'])
+              server = ThreadingHTTPServer((host, port), TunnelRequestHandler)
+              server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              
+              logger.info(f"Listening on {host}:{port}")
+              
+              try:
+                  server.serve_forever()
+              except KeyboardInterrupt:
+                  logger.info("Shutting down...")
+                  server.shutdown()
+          TUNNELPY
+
+          # Patch config.py
+          cat > "$PROJECT_DIR/http_tunnel/config.py" << 'CONFIGPY'
+          """Configuration via .env file."""
+          
+          import os
+          import secrets
+          from pathlib import Path
+
+          env_file = Path(".env")
+          if env_file.exists():
+              with open(env_file) as f:
+                  for line in f:
+                      line = line.strip()
+                      if line and not line.startswith("#") and "=" in line:
+                          key, _, val = line.partition("=")
+                          val = val.strip().strip('"').strip("'")
+                          if key and val:
+                              os.environ[key] = val
+
+
+          def _env(key, default=None, cast=str):
+              val = os.getenv(key)
+              if val is None:
+                  return default
+              try:
+                  return cast(val)
+              except (ValueError, TypeError):
+                  return default
+
+
+          def _env_int(key, default):
+              return _env(key, default, int)
+
+
+          def _env_float(key, default):
+              return _env(key, default, float)
+
+
+          def _env_bool(key, default):
+              val = os.getenv(key)
+              if val is None:
+                  return default
+              return val.lower() in ('true', '1', 'yes', 'y', 'on')
+
+
+          def _env_list(key, default, cast=str):
+              val = os.getenv(key)
+              if val is None:
+                  return default
+              return [cast(x.strip()) for x in val.split(',') if x.strip()]
+
+
+          def _env_int_list(key, default):
+              return _env_list(key, default, int)
+
+
+          SERVER_CONFIG = {
+              'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
+              'listen_host': _env('LISTEN_HOST', '0.0.0.0'),
+              'listen_port': _env_int('LISTEN_PORT', 8080),
+              'max_post_bytes': _env_int('MAX_POST_BYTES', 5242880),
+              'tcp_timeout': _env_float('TCP_TIMEOUT', 60),
+              'udp_timeout': _env_float('UDP_TIMEOUT', 120),
+              'connect_timeout': _env_float('CONNECT_TIMEOUT', 8),
+              'cleanup_interval': _env_float('CLEANUP_INTERVAL', 30),
+              'recv_buffer': _env_int('RECV_BUFFER', 131072),
+              'send_buffer': _env_int('SEND_BUFFER', 131072),
+              'read_chunk': _env_int('READ_CHUNK', 65536),
+              'read_timeout': _env_float('READ_TIMEOUT', 0.01),
+              'read_extend': _env_float('READ_EXTEND', 0.03),
+              'udp_read_timeout': _env_float('UDP_READ_TIMEOUT', 0.3),
+              'log_level': _env('LOG_LEVEL', 'INFO').upper(),
+          }
+
+
+          CLIENT_CONFIG = {
+              'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
+              'socks_listen_host': _env('SOCKS_LISTEN_HOST', '127.0.0.1'),
+              'socks_listen_port': _env_int('SOCKS_LISTEN_PORT', 1080),
+              'server_url': _env('SERVER_URL', 'http://localhost:8080/tunnel'),
+              'outbound_proxy': _env('OUTBOUND_PROXY', ''),
+              'dns_mode': _env('DNS_MODE', 'server'),
+              'http_timeout': _env_float('HTTP_TIMEOUT', 45),
+              'connect_timeout': _env_float('CONNECT_TIMEOUT', 8),
+              'heartbeat_interval': _env_float('HEARTBEAT_INTERVAL', 1),
+              'heartbeat_max': _env_float('HEARTBEAT_MAX', 15),
+              'batch_wait': _env_float('BATCH_WAIT', 0.01),
+              'reconnect_delay': _env_float('RECONNECT_DELAY', 0.5),
+              'max_post_bytes': _env_int('MAX_POST_BYTES', 5242880),
+              'route_tls': _env('ROUTE_TLS', 'tunnel'),
+              'route_http': _env('ROUTE_HTTP', 'tunnel'),
+              'route_other': _env('ROUTE_OTHER', 'tunnel'),
+              'recv_chunk': _env_int('RECV_CHUNK', 65536),
+              'fast_drain_threshold': _env_int('FAST_DRAIN_THRESHOLD', 32768),
+              'fast_drain_interval': _env_float('FAST_DRAIN_INTERVAL', 0.05),
+              'http_pool_size': _env_int('HTTP_POOL_SIZE', 30),
+              'bypass_local': _env_bool('BYPASS_LOCAL', True),
+              'bypass_ranges': _env_list('BYPASS_RANGES', [
+                  '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'
+              ]),
+              'high_priority_ports': _env_int_list('HIGH_PRIORITY_PORTS', [22, 80, 443, 8080]),
+              'log_level': _env('LOG_LEVEL', 'INFO').upper(),
+          }
+          CONFIGPY
+
+          # Create .env
+          echo "⚙️  Creating .env..."
+          cat > "$PROJECT_DIR/.env" << ENVEOF
+          ENCRYPTION_KEY=ENCRYPTION_KEY_PLACEHOLDER
+          LISTEN_HOST=LISTEN_HOST_PLACEHOLDER
+          LISTEN_PORT=LISTEN_PORT_PLACEHOLDER
+          TCP_TIMEOUT=TCP_TIMEOUT_PLACEHOLDER
+          UDP_TIMEOUT=UDP_TIMEOUT_PLACEHOLDER
+          CONNECT_TIMEOUT=CONNECT_TIMEOUT_PLACEHOLDER
+          CLEANUP_INTERVAL=CLEANUP_INTERVAL_PLACEHOLDER
+          RECV_BUFFER=RECV_BUFFER_PLACEHOLDER
+          SEND_BUFFER=SEND_BUFFER_PLACEHOLDER
+          READ_CHUNK=READ_CHUNK_PLACEHOLDER
+          READ_TIMEOUT=READ_TIMEOUT_PLACEHOLDER
+          READ_EXTEND=READ_EXTEND_PLACEHOLDER
+          UDP_READ_TIMEOUT=UDP_READ_TIMEOUT_PLACEHOLDER
+          MAX_POST_BYTES=MAX_POST_BYTES_PLACEHOLDER
+          LOG_LEVEL=LOG_LEVEL_PLACEHOLDER
+          ENVEOF
+          chmod 600 "$PROJECT_DIR/.env"
+          chown -R tunnel:tunnel "$PROJECT_DIR" 2>/dev/null || true
+
+          # Setup Python
+          echo "🐍 Setting up Python..."
+          cd "$PROJECT_DIR"
+          [ -d venv ] && rm -rf venv
+          python3 -m venv venv
+          $PROJECT_DIR/venv/bin/pip install --upgrade pip -q
+          $PROJECT_DIR/venv/bin/pip install -r requirements.txt -q
+
+          # Validate
+          echo "🧪 Testing imports..."
+          $PROJECT_DIR/venv/bin/python -c "
+          import sys; sys.path.insert(0, '$PROJECT_DIR')
+          from http_tunnel.server.tunnel import run_server
+          print('✅ Modules loaded')
+          "
+
+          # Create user if not exists
+          id -u tunnel > /dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d /nonexistent -M tunnel
+          chown -R tunnel:tunnel "$PROJECT_DIR"
+
+          # Firewall
+          echo "🔥 Opening port..."
+          ufw status | grep -q "LISTEN_PORT_PLACEHOLDER/tcp" || {
+            ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
+          }
+
+          # Systemd service
+          echo "🔧 Creating service..."
+          cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
+          [Unit]
+          Description=HTTP Tunnel Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=tunnel
+          WorkingDirectory=$PROJECT_DIR
+          Environment=PATH=$PROJECT_DIR/venv/bin:/usr/bin:/bin
+          Environment=PYTHONUNBUFFERED=1
+          ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/server.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=append:/var/log/$SERVICE_NAME.log
+          StandardError=append:/var/log/$SERVICE_NAME.log
+          NoNewPrivileges=yes
+          PrivateTmp=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          ReadWritePaths=$PROJECT_DIR
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICEEOF
+
+          systemctl daemon-reload
+          systemctl enable $SERVICE_NAME
+
+          # Start
+          echo "▶️  Starting..."
+          systemctl restart $SERVICE_NAME
+          sleep 4
+
+          if systemctl is-active --quiet $SERVICE_NAME; then
+            echo "✅ RUNNING"
+            systemctl status $SERVICE_NAME --no-pager -l
+            echo "📊 Logs:"
+            tail -10 /var/log/$SERVICE_NAME.log 2>/dev/null || true
+          else
+            echo "❌ FAILED"
+            tail -30 /var/log/$SERVICE_NAME.log 2>/dev/null || true
+            journalctl -u $SERVICE_NAME -n 30 --no-pager || true
+            exit 1
+          fi
+          SCRIPTEOF
+
+          # Replace all placeholders with actual values
+          sed -i "s|PROJECT_DIR_PLACEHOLDER|${{ env.PROJECT_DIR }}|g" /tmp/deploy_script.sh
+          sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/deploy_script.sh
+          sed -i "s|ENCRYPTION_KEY_PLACEHOLDER|${ENCRYPTION_KEY}|g" /tmp/deploy_script.sh
+          sed -i "s|LISTEN_HOST_PLACEHOLDER|${LISTEN_HOST}|g" /tmp/deploy_script.sh
+          sed -i "s|LISTEN_PORT_PLACEHOLDER|${LISTEN_PORT}|g" /tmp/deploy_script.sh
+          sed -i "s|TCP_TIMEOUT_PLACEHOLDER|${TCP_TIMEOUT}|g" /tmp/deploy_script.sh
+          sed -i "s|UDP_TIMEOUT_PLACEHOLDER|${UDP_TIMEOUT}|g" /tmp/deploy_script.sh
+          sed -i "s|CONNECT_TIMEOUT_PLACEHOLDER|${CONNECT_TIMEOUT}|g" /tmp/deploy_script.sh
+          sed -i "s|CLEANUP_INTERVAL_PLACEHOLDER|${CLEANUP_INTERVAL}|g" /tmp/deploy_script.sh
+          sed -i "s|RECV_BUFFER_PLACEHOLDER|${RECV_BUFFER}|g" /tmp/deploy_script.sh
+          sed -i "s|SEND_BUFFER_PLACEHOLDER|${SEND_BUFFER}|g" /tmp/deploy_script.sh
+          sed -i "s|READ_CHUNK_PLACEHOLDER|${READ_CHUNK}|g" /tmp/deploy_script.sh
+          sed -i "s|READ_TIMEOUT_PLACEHOLDER|${READ_TIMEOUT}|g" /tmp/deploy_script.sh
+          sed -i "s|READ_EXTEND_PLACEHOLDER|${READ_EXTEND}|g" /tmp/deploy_script.sh
+          sed -i "s|UDP_READ_TIMEOUT_PLACEHOLDER|${UDP_READ_TIMEOUT}|g" /tmp/deploy_script.sh
+          sed -i "s|MAX_POST_BYTES_PLACEHOLDER|${MAX_POST_BYTES}|g" /tmp/deploy_script.sh
+          sed -i "s|LOG_LEVEL_PLACEHOLDER|${LOG_LEVEL}|g" /tmp/deploy_script.sh
+
+          # Upload and execute
+          scp /tmp/deploy_script.sh ${{ secrets.VPS_USER || 'root' }}@${{ secrets.VPS_HOST }}:/tmp/deploy_script.sh
+          ssh ${{ secrets.VPS_USER || 'root' }}@${{ secrets.VPS_HOST }} "bash /tmp/deploy_script.sh"
