@@ -122,27 +122,27 @@ jobs:
           cd "$PROJECT_DIR"
           rm -rf venv
           python3 -m venv venv
-          $PROJECT_DIR/venv/bin/pip install --upgrade pip setuptools wheel
-          $PROJECT_DIR/venv/bin/pip install cryptography requests python-dotenv
+          $PROJECT_DIR/venv/bin/pip install --upgrade pip setuptools wheel -q
+          $PROJECT_DIR/venv/bin/pip install cryptography requests python-dotenv -q
 
-          # ─── Verify install ─────────────────────────
-          echo "  Verifying Python packages..."
-          $PROJECT_DIR/venv/bin/python << 'PYEOF'
-          import sys
-          sys.path.insert(0, "/opt/http-tunnel")
+          # Clear Python cache
+          find "$PROJECT_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$PROJECT_DIR" -name "*.pyc" -delete 2>/dev/null || true
+
+          echo "  Verifying..."
+          $PROJECT_DIR/venv/bin/python -c "
           from cryptography.fernet import Fernet
-          import requests
-          from http_tunnel.server.tunnel import run_server
-          print("  ✅ All modules loaded successfully")
-          PYEOF
+          import sys; sys.path.insert(0, '/opt/http-tunnel')
+          from http_tunnel.config import SERVER_CONFIG
+          print(f'  ✅ Ready - Port: {SERVER_CONFIG[\"listen_port\"]}')
+          "
 
-          # ─── Firewall ───────────────────────────────
-          echo "[5/5] 🔥 Configuring firewall & service..."
+          # ─── Firewall & Service ─────────────────────
+          echo "[5/5] 🔥 Configuring..."
           ufw status | grep -q "LISTEN_PORT_PLACEHOLDER/tcp" || {
               ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
           }
 
-          # ─── Systemd Service ────────────────────────
           cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
           [Unit]
           Description=HTTP Tunnel Server
@@ -166,7 +166,9 @@ jobs:
           systemctl daemon-reload
           systemctl enable $SERVICE_NAME --quiet
 
-          # ─── Start ──────────────────────────────────
+          # Clear old logs
+          echo "" > /var/log/$SERVICE_NAME.log
+
           echo "▶️  Starting..."
           systemctl restart $SERVICE_NAME
           sleep 3
@@ -180,10 +182,7 @@ jobs:
               echo ""
               echo "❌ FAILED"
               echo ""
-              echo "─── Error Log ───"
               tail -20 /var/log/$SERVICE_NAME.log 2>/dev/null || true
-              echo ""
-              echo "─── Journal ───"
               journalctl -u $SERVICE_NAME -n 10 --no-pager || true
               exit 1
           fi
