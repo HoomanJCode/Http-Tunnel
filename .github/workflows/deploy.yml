@@ -262,22 +262,28 @@ jobs:
           cd "$PROJECT_DIR"
           rm -rf venv
           python3 -m venv venv
+          
+          echo "  Installing packages..."
           "$PROJECT_DIR/venv/bin/pip" install --upgrade pip 2>&1 | tail -1
-          "$PROJECT_DIR/venv/bin/pip" install cryptography requests python-dotenv 2>&1 | tail -3
-
-          # Verify install
+          
+          if ! "$PROJECT_DIR/venv/bin/pip" install cryptography requests python-dotenv 2>&1 | tee /tmp/pip_log.txt; then
+              echo "❌ pip install failed:"
+              cat /tmp/pip_log.txt
+              exit 1
+          fi
+          
           echo "  Verifying packages..."
-          "$PROJECT_DIR/venv/bin/python" -c "from cryptography.fernet import Fernet; print('  ✅ cryptography')"
-          "$PROJECT_DIR/venv/bin/python" -c "import requests; print('  ✅ requests')"
+          "$PROJECT_DIR/venv/bin/python" -c "from cryptography.fernet import Fernet; print('  ✅ cryptography')" || { echo "❌ cryptography missing"; exit 1; }
+          "$PROJECT_DIR/venv/bin/python" -c "import requests; print('  ✅ requests')" || { echo "❌ requests missing"; exit 1; }
 
-          chown -R tunnel:tunnel "$PROJECT_DIR"
+          chown -R tunnel:tunnel "$PROJECT_DIR" 2>/dev/null || true
 
           # Firewall
           ufw status | grep -q "LISTEN_PORT_PLACEHOLDER/tcp" || {
               ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
           }
 
-          # Systemd (run as root for port binding, drop to tunnel for safety)
+          # Systemd
           cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
           [Unit]
           Description=HTTP Tunnel Server
@@ -311,7 +317,7 @@ jobs:
               echo "✅ RUNNING on LISTEN_HOST_PLACEHOLDER:LISTEN_PORT_PLACEHOLDER"
               systemctl status $SERVICE_NAME --no-pager -l
               echo "📊 Logs:"
-              tail -10 /var/log/$SERVICE_NAME.log 2>/dev/null || true
+              tail -5 /var/log/$SERVICE_NAME.log 2>/dev/null || true
           else
               echo "❌ FAILED"
               tail -30 /var/log/$SERVICE_NAME.log 2>/dev/null || true
