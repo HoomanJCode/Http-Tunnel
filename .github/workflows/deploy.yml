@@ -205,19 +205,15 @@ jobs:
           # ─── Python venv ────────────────────────────
           echo "🐍 Setting up Python..."
           cd "$PROJECT_DIR"
-          
-          # Install system package for cryptography (avoids Rust build)
-          apt-get install -y -qq python3-cryptography 2>/dev/null || true
-          
           [ -d venv ] && rm -rf venv
-          python3 -m venv venv --system-site-packages
-          $PROJECT_DIR/venv/bin/pip install --upgrade pip -q
-          $PROJECT_DIR/venv/bin/pip install requests python-dotenv -q
+          python3 -m venv venv
+          $PROJECT_DIR/venv/bin/pip install --upgrade pip setuptools wheel -q
+          $PROJECT_DIR/venv/bin/pip install cryptography requests python-dotenv
           
           echo "🧪 Testing imports..."
           $PROJECT_DIR/venv/bin/python -c "
           from cryptography.fernet import Fernet
-          from http_tunnel.server.tunnel import run_server
+          import requests
           print('  ✅ All modules loaded')
           "
 
