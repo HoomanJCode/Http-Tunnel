@@ -12,6 +12,7 @@ GitHub Actions usage:
     All optional secrets have sensible defaults.
 
 All server config parameters are written to the VPS .env file.
+Old JSON wizard code is automatically patched to use .env.
 """
 
 import os
@@ -167,10 +168,186 @@ def generate_deploy_script():
         echo "  ✅ Code cloned"
     fi
 
+    # ─── Patch: Replace JSON wizard with .env config ───
+    echo "  🔧 Patching server to use .env..."
+    cd "$PROJECT_DIR"
+    
+    # Overwrite tunnel.py with .env version
+    cat > http_tunnel/server/tunnel.py << 'TUNNELPY'
+"""Server entry point - uses .env configuration."""
+
+import os
+import socket
+from http.server import HTTPServer
+from socketserver import ThreadingMixIn
+
+from http_tunnel.config import SERVER_CONFIG
+from http_tunnel.logging import setup_logging
+from http_tunnel.crypto import TunnelCrypto
+from http_tunnel.server.handler import TunnelRequestHandler
+from http_tunnel.server.cleaner import SessionCleaner
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+
+def run_server():
+    config = SERVER_CONFIG
+    
+    if not config.get('encryption_key'):
+        print("ENCRYPTION_KEY not set in .env")
+        return
+    
+    logger = setup_logging(config, "server")
+    logger.info("Starting server...")
+    
+    TunnelRequestHandler.logger = logger
+    TunnelRequestHandler.crypto = TunnelCrypto(config['encryption_key'])
+    TunnelRequestHandler.max_post_bytes = int(config['max_post_bytes'])
+    TunnelRequestHandler.tcp_timeout = float(config['tcp_timeout'])
+    TunnelRequestHandler.udp_timeout = float(config['udp_timeout'])
+    TunnelRequestHandler.connect_timeout = float(config['connect_timeout'])
+    TunnelRequestHandler.recv_buffer = int(config['recv_buffer'])
+    TunnelRequestHandler.send_buffer = int(config['send_buffer'])
+    TunnelRequestHandler.read_chunk = int(config['read_chunk'])
+    TunnelRequestHandler.read_timeout = float(config['read_timeout'])
+    TunnelRequestHandler.read_extend = float(config['read_extend'])
+    TunnelRequestHandler.udp_read_timeout = float(config['udp_read_timeout'])
+    
+    cleaner = SessionCleaner(TunnelRequestHandler, float(config['cleanup_interval']))
+    cleaner.start()
+    
+    host = config['listen_host']
+    port = int(config['listen_port'])
+    server = ThreadingHTTPServer((host, port), TunnelRequestHandler)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    logger.info(f"Listening on {{host}}:{{port}} (multi-threaded)")
+    logger.info(f"TCP timeout: {{config['tcp_timeout']}}s, UDP: {{config['udp_timeout']}}s")
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        server.shutdown()
+TUNNELPY
+
+    # Overwrite config.py with .env version (no wizard)
+    cat > http_tunnel/config.py << 'CONFIGPY'
+"""Configuration via .env file and environment variables."""
+
+import os
+import secrets
+from pathlib import Path
+
+env_file = Path(".env")
+if env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    val = val.strip().strip('"').strip("'")
+                    if key and val:
+                        os.environ[key] = val
+
+
+def _env(key, default=None, cast=str):
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return cast(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_int(key, default):
+    return _env(key, default, int)
+
+
+def _env_float(key, default):
+    return _env(key, default, float)
+
+
+def _env_bool(key, default):
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return val.lower() in ('true', '1', 'yes', 'y', 'on')
+
+
+def _env_list(key, default, cast=str):
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return [cast(x.strip()) for x in val.split(',') if x.strip()]
+
+
+def _env_int_list(key, default):
+    return _env_list(key, default, int)
+
+
+SERVER_CONFIG = {{
+    'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
+    'listen_host': _env('LISTEN_HOST', '0.0.0.0'),
+    'listen_port': _env_int('LISTEN_PORT', 8080),
+    'max_post_bytes': _env_int('MAX_POST_BYTES', 5242880),
+    'tcp_timeout': _env_float('TCP_TIMEOUT', 60),
+    'udp_timeout': _env_float('UDP_TIMEOUT', 120),
+    'connect_timeout': _env_float('CONNECT_TIMEOUT', 8),
+    'cleanup_interval': _env_float('CLEANUP_INTERVAL', 30),
+    'recv_buffer': _env_int('RECV_BUFFER', 131072),
+    'send_buffer': _env_int('SEND_BUFFER', 131072),
+    'read_chunk': _env_int('READ_CHUNK', 65536),
+    'read_timeout': _env_float('READ_TIMEOUT', 0.01),
+    'read_extend': _env_float('READ_EXTEND', 0.03),
+    'udp_read_timeout': _env_float('UDP_READ_TIMEOUT', 0.3),
+    'log_level': _env('LOG_LEVEL', 'INFO').upper(),
+}}
+
+
+CLIENT_CONFIG = {{
+    'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
+    'socks_listen_host': _env('SOCKS_LISTEN_HOST', '127.0.0.1'),
+    'socks_listen_port': _env_int('SOCKS_LISTEN_PORT', 1080),
+    'server_url': _env('SERVER_URL', 'http://localhost:8080/tunnel'),
+    'outbound_proxy': _env('OUTBOUND_PROXY', ''),
+    'dns_mode': _env('DNS_MODE', 'server'),
+    'http_timeout': _env_float('HTTP_TIMEOUT', 45),
+    'connect_timeout': _env_float('CONNECT_TIMEOUT', 8),
+    'heartbeat_interval': _env_float('HEARTBEAT_INTERVAL', 1),
+    'heartbeat_max': _env_float('HEARTBEAT_MAX', 15),
+    'batch_wait': _env_float('BATCH_WAIT', 0.01),
+    'reconnect_delay': _env_float('RECONNECT_DELAY', 0.5),
+    'max_post_bytes': _env_int('MAX_POST_BYTES', 5242880),
+    'route_tls': _env('ROUTE_TLS', 'tunnel'),
+    'route_http': _env('ROUTE_HTTP', 'tunnel'),
+    'route_other': _env('ROUTE_OTHER', 'tunnel'),
+    'recv_chunk': _env_int('RECV_CHUNK', 65536),
+    'fast_drain_threshold': _env_int('FAST_DRAIN_THRESHOLD', 32768),
+    'fast_drain_interval': _env_float('FAST_DRAIN_INTERVAL', 0.05),
+    'http_pool_size': _env_int('HTTP_POOL_SIZE', 30),
+    'bypass_local': _env_bool('BYPASS_LOCAL', True),
+    'bypass_ranges': _env_list('BYPASS_RANGES', [
+        '127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'
+    ]),
+    'high_priority_ports': _env_int_list('HIGH_PRIORITY_PORTS', [22, 80, 443, 8080]),
+    'log_level': _env('LOG_LEVEL', 'INFO').upper(),
+}}
+CONFIGPY
+
+    echo "  ✅ Server patched to use .env"
+
     # ─── Create .env ───────────────────────────────────
     echo "[6/8] ⚙️  Creating .env..."
     cat > "$PROJECT_DIR/.env" << 'ENVEOF'
-    # HTTP Tunnel Server Configuration
     ENCRYPTION_KEY={ENCRYPTION_KEY}
     LISTEN_HOST={LISTEN_HOST}
     LISTEN_PORT={LISTEN_PORT}
