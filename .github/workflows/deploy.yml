@@ -65,59 +65,40 @@ jobs:
           echo "=========================================="
           echo ""
 
-          # ─── Disk Space ─────────────────────────────
-          echo "[1/7] 💾 Checking disk space..."
-          AVAILABLE=$(df -BG /opt 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
-          if [ -n "$AVAILABLE" ] && [ "$AVAILABLE" -lt 1 ]; then
-              echo "❌ Less than 1GB disk space ($AVAILABLE GB). Aborting."
-              exit 1
-          fi
-          echo "  ✅ OK ($AVAILABLE GB)"
-
           # ─── Install Dependencies ───────────────────
-          echo "[2/7] 📦 Installing packages..."
+          echo "📦 Installing system packages..."
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
-          apt-get install -y -qq python3 python3-pip python3-venv git curl 2>&1 | tail -1
-
-          # ─── Create User ────────────────────────────
-          echo "[3/7] 👤 Creating service user..."
-          if ! id -u tunnel > /dev/null 2>&1; then
-              useradd -r -s /usr/sbin/nologin -d /nonexistent -M tunnel
-              echo "  ✅ Created"
-          else
-              echo "  ✅ Exists"
-          fi
-
-          # Give tunnel user permission to bind to ports
-          setcap 'cap_net_bind_service=+ep' /usr/bin/python3 2>/dev/null || true
+          apt-get install -y -qq python3 python3-pip python3-venv git curl
 
           # ─── Stop Service ───────────────────────────
           if systemctl is-active --quiet $SERVICE_NAME; then
+              echo "⏹️  Stopping $SERVICE_NAME..."
               systemctl stop $SERVICE_NAME
-              sleep 2
+              sleep 3
           fi
 
           # ─── Fix Git Ownership ──────────────────────
           git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
 
           # ─── Deploy Code ────────────────────────────
-          echo "[4/7] 📥 Deploying code..."
           if [ -d "$PROJECT_DIR/.git" ]; then
+              echo "📥 Pulling latest code..."
               cd "$PROJECT_DIR"
-              git fetch origin --quiet
-              git reset --hard origin/master --quiet
-              git clean -fd -e ".env" -e "*.log" --quiet
-              echo "  ✅ Updated"
+              git fetch origin
+              git reset --hard origin/master
+              git clean -fd -e ".env" -e "*.log"
+              echo "  ✅ Code updated"
           else
-              mkdir -p "$PROJECT_DIR"
-              git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR" --quiet
+              echo "📥 Cloning repository..."
+              rm -rf "$PROJECT_DIR"
+              git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR"
               cd "$PROJECT_DIR"
-              echo "  ✅ Cloned"
+              echo "  ✅ Code cloned"
           fi
 
           # ─── Patch Server ───────────────────────────
-          echo "[5/7] 🔧 Patching server..."
+          echo "🔧 Patching server to use .env..."
           cat > "$PROJECT_DIR/http_tunnel/server/tunnel.py" << 'TUNNELPY'
           """Server entry point - uses .env configuration."""
           import os, socket
@@ -180,15 +161,6 @@ jobs:
               except: return default
           def _env_int(key, default): return _env(key, default, int)
           def _env_float(key, default): return _env(key, default, float)
-          def _env_bool(key, default):
-              val = os.getenv(key)
-              if val is None: return default
-              return val.lower() in ('true','1','yes','y','on')
-          def _env_list(key, default, cast=str):
-              val = os.getenv(key)
-              if val is None: return default
-              return [cast(x.strip()) for x in val.split(',') if x.strip()]
-          def _env_int_list(key, default): return _env_list(key, default, int)
           SERVER_CONFIG = {
               'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
               'listen_host': _env('LISTEN_HOST', '0.0.0.0'),
@@ -206,37 +178,11 @@ jobs:
               'udp_read_timeout': _env_float('UDP_READ_TIMEOUT', 0.3),
               'log_level': _env('LOG_LEVEL', 'INFO').upper(),
           }
-          CLIENT_CONFIG = {
-              'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
-              'socks_listen_host': _env('SOCKS_LISTEN_HOST', '127.0.0.1'),
-              'socks_listen_port': _env_int('SOCKS_LISTEN_PORT', 1080),
-              'server_url': _env('SERVER_URL', 'http://localhost:8080/tunnel'),
-              'outbound_proxy': _env('OUTBOUND_PROXY', ''),
-              'dns_mode': _env('DNS_MODE', 'server'),
-              'http_timeout': _env_float('HTTP_TIMEOUT', 45),
-              'connect_timeout': _env_float('CONNECT_TIMEOUT', 8),
-              'heartbeat_interval': _env_float('HEARTBEAT_INTERVAL', 1),
-              'heartbeat_max': _env_float('HEARTBEAT_MAX', 15),
-              'batch_wait': _env_float('BATCH_WAIT', 0.01),
-              'reconnect_delay': _env_float('RECONNECT_DELAY', 0.5),
-              'max_post_bytes': _env_int('MAX_POST_BYTES', 5242880),
-              'route_tls': _env('ROUTE_TLS', 'tunnel'),
-              'route_http': _env('ROUTE_HTTP', 'tunnel'),
-              'route_other': _env('ROUTE_OTHER', 'tunnel'),
-              'recv_chunk': _env_int('RECV_CHUNK', 65536),
-              'fast_drain_threshold': _env_int('FAST_DRAIN_THRESHOLD', 32768),
-              'fast_drain_interval': _env_float('FAST_DRAIN_INTERVAL', 0.05),
-              'http_pool_size': _env_int('HTTP_POOL_SIZE', 30),
-              'bypass_local': _env_bool('BYPASS_LOCAL', True),
-              'bypass_ranges': _env_list('BYPASS_RANGES', ['127.0.0.0/8','10.0.0.0/8','172.16.0.0/12','192.168.0.0/16']),
-              'high_priority_ports': _env_int_list('HIGH_PRIORITY_PORTS', [22,80,443,8080]),
-              'log_level': _env('LOG_LEVEL', 'INFO').upper(),
-          }
           CONFIGPY
           echo "  ✅ Patched"
 
           # ─── Create .env ────────────────────────────
-          echo "[6/7] ⚙️  Creating .env..."
+          echo "⚙️  Creating .env..."
           cat > "$PROJECT_DIR/.env" << ENVEOF
           ENCRYPTION_KEY=ENCRYPTION_KEY_PLACEHOLDER
           LISTEN_HOST=LISTEN_HOST_PLACEHOLDER
@@ -255,35 +201,34 @@ jobs:
           LOG_LEVEL=LOG_LEVEL_PLACEHOLDER
           ENVEOF
           chmod 600 "$PROJECT_DIR/.env"
-          echo "  ✅ Created"
 
-          # ─── Python & Service ───────────────────────
-          echo "[7/7] 🐍 Setting up Python & service..."
+          # ─── Python venv ────────────────────────────
+          echo "🐍 Setting up Python..."
           cd "$PROJECT_DIR"
-          rm -rf venv
+          [ -d venv ] && rm -rf venv
           python3 -m venv venv
-          
-          echo "  Installing packages..."
-          "$PROJECT_DIR/venv/bin/pip" install --upgrade pip 2>&1 | tail -1
-          
-          if ! "$PROJECT_DIR/venv/bin/pip" install cryptography requests python-dotenv 2>&1 | tee /tmp/pip_log.txt; then
-              echo "❌ pip install failed:"
-              cat /tmp/pip_log.txt
-              exit 1
-          fi
-          
-          echo "  Verifying packages..."
-          "$PROJECT_DIR/venv/bin/python" -c "from cryptography.fernet import Fernet; print('  ✅ cryptography')" || { echo "❌ cryptography missing"; exit 1; }
-          "$PROJECT_DIR/venv/bin/python" -c "import requests; print('  ✅ requests')" || { echo "❌ requests missing"; exit 1; }
+          $PROJECT_DIR/venv/bin/pip install --upgrade pip -q
+          $PROJECT_DIR/venv/bin/pip install -r requirements.txt -q
 
-          chown -R tunnel:tunnel "$PROJECT_DIR" 2>/dev/null || true
+          echo "🧪 Testing imports..."
+          $PROJECT_DIR/venv/bin/python -c "
+          import sys; sys.path.insert(0, '$PROJECT_DIR')
+          from cryptography.fernet import Fernet
+          from http_tunnel.server.tunnel import run_server
+          print('  ✅ All modules loaded')
+          "
 
-          # Firewall
+          # ─── Permissions ────────────────────────────
+          chown -R root:root "$PROJECT_DIR"
+
+          # ─── Firewall ───────────────────────────────
+          echo "🔥 Opening port..."
           ufw status | grep -q "LISTEN_PORT_PLACEHOLDER/tcp" || {
               ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
           }
 
-          # Systemd
+          # ─── Systemd Service ────────────────────────
+          echo "🔧 Creating service..."
           cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
           [Unit]
           Description=HTTP Tunnel Server
@@ -306,9 +251,8 @@ jobs:
           SERVICEEOF
 
           systemctl daemon-reload
-          systemctl enable $SERVICE_NAME --quiet
+          systemctl enable $SERVICE_NAME
 
-          # Start
           echo "▶️  Starting..."
           systemctl restart $SERVICE_NAME
           sleep 4
@@ -320,8 +264,8 @@ jobs:
               tail -5 /var/log/$SERVICE_NAME.log 2>/dev/null || true
           else
               echo "❌ FAILED"
-              tail -30 /var/log/$SERVICE_NAME.log 2>/dev/null || true
-              journalctl -u $SERVICE_NAME -n 30 --no-pager || true
+              tail -20 /var/log/$SERVICE_NAME.log 2>/dev/null || true
+              journalctl -u $SERVICE_NAME -n 20 --no-pager || true
               exit 1
           fi
           SCRIPTEOF
