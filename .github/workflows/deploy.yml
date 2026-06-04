@@ -54,8 +54,8 @@ jobs:
           #!/bin/bash
           set -e
 
-          PROJECT_DIR="PROJECT_DIR_PLACEHOLDER"
-          SERVICE_NAME="SERVICE_NAME_PLACEHOLDER"
+          PROJECT_DIR="/opt/http-tunnel"
+          SERVICE_NAME="http-tunnel-server"
 
           echo "=========================================="
           echo "  HTTP Tunnel Server Deployment"
@@ -65,8 +65,8 @@ jobs:
           echo "=========================================="
           echo ""
 
-          # ─── Install Dependencies ───────────────────
-          echo "📦 Installing system packages..."
+          # ─── Install System Packages ────────────────
+          echo "[1/5] 📦 Installing system packages..."
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq python3 python3-pip python3-venv git curl
@@ -75,114 +75,29 @@ jobs:
           if systemctl is-active --quiet $SERVICE_NAME; then
               echo "⏹️  Stopping $SERVICE_NAME..."
               systemctl stop $SERVICE_NAME
-              sleep 3
+              sleep 2
           fi
 
           # ─── Fix Git Ownership ──────────────────────
           git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
 
           # ─── Deploy Code ────────────────────────────
+          echo "[2/5] 📥 Deploying code..."
           if [ -d "$PROJECT_DIR/.git" ]; then
-              echo "📥 Pulling latest code..."
               cd "$PROJECT_DIR"
-              git fetch origin
-              git reset --hard origin/master
-              git clean -fd -e ".env" -e "*.log"
+              git fetch origin --quiet
+              git reset --hard origin/master --quiet
+              git clean -fd -e ".env" -e "*.log" --quiet
               echo "  ✅ Code updated"
           else
-              echo "📥 Cloning repository..."
-              rm -rf "$PROJECT_DIR"
-              git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR"
+              mkdir -p "$PROJECT_DIR"
+              git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR" --quiet
               cd "$PROJECT_DIR"
               echo "  ✅ Code cloned"
           fi
 
-          # ─── Patch Server ───────────────────────────
-          echo "🔧 Patching server to use .env..."
-          cat > "$PROJECT_DIR/http_tunnel/server/tunnel.py" << 'TUNNELPY'
-          """Server entry point - uses .env configuration."""
-          import os, socket
-          from http.server import HTTPServer
-          from socketserver import ThreadingMixIn
-          from http_tunnel.config import SERVER_CONFIG
-          from http_tunnel.logging import setup_logging
-          from http_tunnel.crypto import TunnelCrypto
-          from http_tunnel.server.handler import TunnelRequestHandler
-          from http_tunnel.server.cleaner import SessionCleaner
-
-          class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-              daemon_threads = True
-              request_queue_size = 128
-
-          def run_server():
-              config = SERVER_CONFIG
-              if not config.get('encryption_key'):
-                  print("ENCRYPTION_KEY not set"); return
-              logger = setup_logging(config, "server")
-              TunnelRequestHandler.logger = logger
-              TunnelRequestHandler.crypto = TunnelCrypto(config['encryption_key'])
-              TunnelRequestHandler.max_post_bytes = int(config['max_post_bytes'])
-              TunnelRequestHandler.tcp_timeout = float(config['tcp_timeout'])
-              TunnelRequestHandler.udp_timeout = float(config['udp_timeout'])
-              TunnelRequestHandler.connect_timeout = float(config['connect_timeout'])
-              TunnelRequestHandler.recv_buffer = int(config['recv_buffer'])
-              TunnelRequestHandler.send_buffer = int(config['send_buffer'])
-              TunnelRequestHandler.read_chunk = int(config['read_chunk'])
-              TunnelRequestHandler.read_timeout = float(config['read_timeout'])
-              TunnelRequestHandler.read_extend = float(config['read_extend'])
-              TunnelRequestHandler.udp_read_timeout = float(config['udp_read_timeout'])
-              cleaner = SessionCleaner(TunnelRequestHandler, float(config['cleanup_interval']))
-              cleaner.start()
-              host = config['listen_host']
-              port = int(config['listen_port'])
-              server = ThreadingHTTPServer((host, port), TunnelRequestHandler)
-              server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-              logger.info(f"Listening on {host}:{port}")
-              try: server.serve_forever()
-              except KeyboardInterrupt: logger.info("Shutting down..."); server.shutdown()
-          TUNNELPY
-
-          cat > "$PROJECT_DIR/http_tunnel/config.py" << 'CONFIGPY'
-          import os, secrets
-          from pathlib import Path
-          env_file = Path(".env")
-          if env_file.exists():
-              with open(env_file) as f:
-                  for line in f:
-                      line = line.strip()
-                      if line and not line.startswith("#") and "=" in line:
-                          key, _, val = line.partition("=")
-                          val = val.strip().strip('"').strip("'")
-                          if key and val: os.environ[key] = val
-          def _env(key, default=None, cast=str):
-              val = os.getenv(key)
-              if val is None: return default
-              try: return cast(val)
-              except: return default
-          def _env_int(key, default): return _env(key, default, int)
-          def _env_float(key, default): return _env(key, default, float)
-          SERVER_CONFIG = {
-              'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
-              'listen_host': _env('LISTEN_HOST', '0.0.0.0'),
-              'listen_port': _env_int('LISTEN_PORT', 8080),
-              'max_post_bytes': _env_int('MAX_POST_BYTES', 5242880),
-              'tcp_timeout': _env_float('TCP_TIMEOUT', 60),
-              'udp_timeout': _env_float('UDP_TIMEOUT', 120),
-              'connect_timeout': _env_float('CONNECT_TIMEOUT', 8),
-              'cleanup_interval': _env_float('CLEANUP_INTERVAL', 30),
-              'recv_buffer': _env_int('RECV_BUFFER', 131072),
-              'send_buffer': _env_int('SEND_BUFFER', 131072),
-              'read_chunk': _env_int('READ_CHUNK', 65536),
-              'read_timeout': _env_float('READ_TIMEOUT', 0.01),
-              'read_extend': _env_float('READ_EXTEND', 0.03),
-              'udp_read_timeout': _env_float('UDP_READ_TIMEOUT', 0.3),
-              'log_level': _env('LOG_LEVEL', 'INFO').upper(),
-          }
-          CONFIGPY
-          echo "  ✅ Patched"
-
           # ─── Create .env ────────────────────────────
-          echo "⚙️  Creating .env..."
+          echo "[3/5] ⚙️  Creating .env..."
           cat > "$PROJECT_DIR/.env" << ENVEOF
           ENCRYPTION_KEY=ENCRYPTION_KEY_PLACEHOLDER
           LISTEN_HOST=LISTEN_HOST_PLACEHOLDER
@@ -203,31 +118,31 @@ jobs:
           chmod 600 "$PROJECT_DIR/.env"
 
           # ─── Python venv ────────────────────────────
-          echo "🐍 Setting up Python..."
+          echo "[4/5] 🐍 Setting up Python..."
           cd "$PROJECT_DIR"
-          [ -d venv ] && rm -rf venv
+          rm -rf venv
           python3 -m venv venv
-          $PROJECT_DIR/venv/bin/pip install --upgrade pip setuptools wheel -q
+          $PROJECT_DIR/venv/bin/pip install --upgrade pip setuptools wheel
           $PROJECT_DIR/venv/bin/pip install cryptography requests python-dotenv
-          
-          echo "🧪 Testing imports..."
-          $PROJECT_DIR/venv/bin/python -c "
+
+          # ─── Verify install ─────────────────────────
+          echo "  Verifying Python packages..."
+          $PROJECT_DIR/venv/bin/python << 'PYEOF'
+          import sys
+          sys.path.insert(0, "/opt/http-tunnel")
           from cryptography.fernet import Fernet
           import requests
-          print('  ✅ All modules loaded')
-          "
-
-          # ─── Permissions ────────────────────────────
-          chown -R root:root "$PROJECT_DIR"
+          from http_tunnel.server.tunnel import run_server
+          print("  ✅ All modules loaded successfully")
+          PYEOF
 
           # ─── Firewall ───────────────────────────────
-          echo "🔥 Opening port..."
+          echo "[5/5] 🔥 Configuring firewall & service..."
           ufw status | grep -q "LISTEN_PORT_PLACEHOLDER/tcp" || {
               ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
           }
 
           # ─── Systemd Service ────────────────────────
-          echo "🔧 Creating service..."
           cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
           [Unit]
           Description=HTTP Tunnel Server
@@ -237,7 +152,6 @@ jobs:
           Type=simple
           User=root
           WorkingDirectory=$PROJECT_DIR
-          Environment=PATH=$PROJECT_DIR/venv/bin:/usr/bin:/bin
           Environment=PYTHONUNBUFFERED=1
           ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/server.py
           Restart=always
@@ -250,28 +164,32 @@ jobs:
           SERVICEEOF
 
           systemctl daemon-reload
-          systemctl enable $SERVICE_NAME
+          systemctl enable $SERVICE_NAME --quiet
 
+          # ─── Start ──────────────────────────────────
           echo "▶️  Starting..."
           systemctl restart $SERVICE_NAME
-          sleep 4
+          sleep 3
 
           if systemctl is-active --quiet $SERVICE_NAME; then
+              echo ""
               echo "✅ RUNNING on LISTEN_HOST_PLACEHOLDER:LISTEN_PORT_PLACEHOLDER"
-              systemctl status $SERVICE_NAME --no-pager -l
-              echo "📊 Logs:"
+              echo ""
               tail -5 /var/log/$SERVICE_NAME.log 2>/dev/null || true
           else
+              echo ""
               echo "❌ FAILED"
+              echo ""
+              echo "─── Error Log ───"
               tail -20 /var/log/$SERVICE_NAME.log 2>/dev/null || true
-              journalctl -u $SERVICE_NAME -n 20 --no-pager || true
+              echo ""
+              echo "─── Journal ───"
+              journalctl -u $SERVICE_NAME -n 10 --no-pager || true
               exit 1
           fi
           SCRIPTEOF
 
           # Replace placeholders
-          sed -i "s|PROJECT_DIR_PLACEHOLDER|${{ env.PROJECT_DIR }}|g" /tmp/deploy_script.sh
-          sed -i "s|SERVICE_NAME_PLACEHOLDER|${{ env.SERVICE_NAME }}|g" /tmp/deploy_script.sh
           sed -i "s|ENCRYPTION_KEY_PLACEHOLDER|${ENCRYPTION_KEY}|g" /tmp/deploy_script.sh
           sed -i "s|LISTEN_HOST_PLACEHOLDER|${LISTEN_HOST}|g" /tmp/deploy_script.sh
           sed -i "s|LISTEN_PORT_PLACEHOLDER|${LISTEN_PORT}|g" /tmp/deploy_script.sh
