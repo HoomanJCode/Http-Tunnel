@@ -2,9 +2,7 @@
 """
 Zero-touch VPS deployment for HTTP Tunnel Server.
 Connects via SSH, installs everything, sets up service.
-
-Prerequisites:
-    pip install python-dotenv
+No manual server access needed.
 
 Usage:
     python3 deploy.py                    # Deploy with .env values
@@ -53,7 +51,6 @@ def load_env():
                             os.environ[key] = val
 
 
-# ─── Configuration ──────────────────────────────────────
 load_env()
 
 VPS_HOST = os.getenv("VPS_HOST", "")
@@ -71,7 +68,7 @@ REPO_URL = "https://github.com/HoomanJCode/Http-Tunnel.git"
 # ─── Deploy Script Generation ───────────────────────────
 def generate_deploy_script():
     """Generate complete bash script that sets up everything on VPS."""
-    
+
     script = textwrap.dedent(f'''\
     #!/bin/bash
     set -e
@@ -79,6 +76,7 @@ def generate_deploy_script():
     PROJECT_DIR="{PROJECT_DIR}"
     SERVICE_NAME="{SERVICE_NAME}"
     REPO_URL="{REPO_URL}"
+    LISTEN_PORT="{LISTEN_PORT}"
 
     echo "=========================================="
     echo "  HTTP Tunnel Server - Auto Deploy"
@@ -88,24 +86,36 @@ def generate_deploy_script():
     echo "=========================================="
     echo ""
 
+    # ─── Disk Space Check ─────────────────────────────
+    echo "[1/8] 💾 Checking disk space..."
+    AVAILABLE=$(df -BG "$PROJECT_DIR" 2>/dev/null | tail -1 | awk '{{print $4}}' | sed 's/G//')
+    if [ -z "$AVAILABLE" ]; then
+        # If directory doesn't exist yet, check parent
+        AVAILABLE=$(df -BG /opt 2>/dev/null | tail -1 | awk '{{print $4}}' | sed 's/G//')
+    fi
+    if [ -n "$AVAILABLE" ] && [ "$AVAILABLE" -lt 1 ]; then
+        echo "❌ Less than 1GB disk space available ($AVAILABLE GB). Aborting."
+        exit 1
+    fi
+    echo "  ✅ Disk space OK ($AVAILABLE GB available)"
+
     # ─── System Setup ──────────────────────────────────
-    echo "[1/7] 📦 Updating system and installing packages..."
+    echo "[2/8] 📦 Updating system and installing packages..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip python3-venv git curl ufw 2>&1 | tail -1
+    apt-get install -y -qq python3 python3-pip python3-venv git curl 2>&1 | tail -1
 
-    # ─── Firewall ──────────────────────────────────────
-    echo "[2/7] 🔥 Configuring firewall..."
-    ufw --force reset > /dev/null 2>&1
-    ufw default deny incoming > /dev/null
-    ufw default allow outgoing > /dev/null
-    ufw allow ssh > /dev/null
-    ufw allow {LISTEN_PORT}/tcp comment "HTTP Tunnel Server" > /dev/null
-    ufw --force enable > /dev/null
-    echo "  ✅ Firewall configured (SSH + {LISTEN_PORT})"
+    # ─── Firewall (only open tunnel port) ──────────────
+    echo "[3/8] 🔥 Ensuring tunnel port is open..."
+    # Add rule only if not already present (do not reset existing rules)
+    ufw status | grep -q "$LISTEN_PORT/tcp" || {{
+        ufw allow $LISTEN_PORT/tcp comment "HTTP Tunnel Server" > /dev/null
+        echo "  ✅ Port $LISTEN_PORT opened"
+    }}
+    ufw status verbose | head -5
 
     # ─── Create User ───────────────────────────────────
-    echo "[3/7] 👤 Creating service user..."
+    echo "[4/8] 👤 Creating service user..."
     if ! id -u tunnel > /dev/null 2>&1; then
         useradd -r -s /usr/sbin/nologin -d /nonexistent -M tunnel
         echo "  ✅ User 'tunnel' created"
@@ -114,7 +124,7 @@ def generate_deploy_script():
     fi
 
     # ─── Clone Repository ──────────────────────────────
-    echo "[4/7] 📥 Deploying code..."
+    echo "[5/8] 📥 Deploying code..."
     if [ -d "$PROJECT_DIR/.git" ]; then
         cd "$PROJECT_DIR"
         git fetch origin --quiet
@@ -128,7 +138,7 @@ def generate_deploy_script():
     fi
 
     # ─── Create .env ───────────────────────────────────
-    echo "[5/7] ⚙️  Creating configuration..."
+    echo "[6/8] ⚙️  Creating configuration..."
     cat > "$PROJECT_DIR/.env" << 'ENVEOF'
     ENCRYPTION_KEY={ENCRYPTION_KEY}
     LISTEN_HOST=0.0.0.0
@@ -140,7 +150,7 @@ def generate_deploy_script():
     echo "  ✅ .env created"
 
     # ─── Python Environment ────────────────────────────
-    echo "[6/7] 🐍 Setting up Python..."
+    echo "[7/8] 🐍 Setting up Python..."
     cd "$PROJECT_DIR"
     if [ -d venv ]; then
         rm -rf venv
@@ -158,7 +168,7 @@ def generate_deploy_script():
     "
 
     # ─── Systemd Service ───────────────────────────────
-    echo "[7/7] 🔧 Creating systemd service..."
+    echo "[8/8] 🔧 Creating systemd service..."
     cat > /etc/systemd/system/$SERVICE_NAME.service << 'SERVICEEOF'
     [Unit]
     Description=HTTP Tunnel Server - TCP/UDP over HTTP
@@ -231,7 +241,7 @@ def generate_deploy_script():
     echo ""
     echo "✅ Zero-touch deployment complete!"
     ''')
-    
+
     return script
 
 
@@ -256,7 +266,7 @@ def generate_uninstall_script():
     # Remove user
     userdel tunnel 2>/dev/null || true
 
-    # Remove firewall rule
+    # Remove firewall rule (only our port)
     ufw delete allow {LISTEN_PORT}/tcp 2>/dev/null || true
 
     echo "✅ HTTP Tunnel Server removed."
@@ -333,13 +343,10 @@ def upload_and_run(script_content, dry_run=False):
 def cmd_deploy(dry_run=False):
     """Full zero-touch deployment."""
     if not VPS_HOST:
-        print("❌ VPS_HOST not set.")
-        print("   Add to .env: VPS_HOST=your-server.com")
+        print("❌ VPS_HOST not set. Add to .env: VPS_HOST=your-server.com")
         sys.exit(1)
     if not ENCRYPTION_KEY:
-        print("❌ ENCRYPTION_KEY not set.")
-        print("   Add to .env: ENCRYPTION_KEY=your-secret-key")
-        print("   (use a long random string)")
+        print("❌ ENCRYPTION_KEY not set. Add to .env: ENCRYPTION_KEY=your-secret-key")
         sys.exit(1)
     
     print(f"🚀 Deploying to {VPS_USER}@{VPS_HOST}:{VPS_PORT}")
@@ -396,19 +403,7 @@ def cmd_restart(dry_run=False):
 
 # ─── Main ───────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="Zero-touch HTTP Tunnel Server Deployment",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 deploy.py              Deploy server to VPS
-  python3 deploy.py --status     Check if server is running
-  python3 deploy.py --logs       View server logs
-  python3 deploy.py --restart    Restart the server
-  python3 deploy.py --uninstall  Remove everything
-  python3 deploy.py --dry-run    Preview without executing
-        """
-    )
+    parser = argparse.ArgumentParser(description="Zero-touch HTTP Tunnel Server Deployment")
     parser.add_argument("--dry-run", action="store_true", help="Preview without executing")
     parser.add_argument("--restart", action="store_true", help="Restart the service")
     parser.add_argument("--status", action="store_true", help="Check service status")
