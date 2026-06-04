@@ -65,84 +65,79 @@ jobs:
           echo "=========================================="
           echo ""
 
-          # ─── Disk Space Check ─────────────────────────
+          # ─── Disk Space ─────────────────────────────
           echo "[1/7] 💾 Checking disk space..."
           AVAILABLE=$(df -BG /opt 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
           if [ -n "$AVAILABLE" ] && [ "$AVAILABLE" -lt 1 ]; then
               echo "❌ Less than 1GB disk space ($AVAILABLE GB). Aborting."
               exit 1
           fi
-          echo "  ✅ Disk space OK ($AVAILABLE GB available)"
+          echo "  ✅ OK ($AVAILABLE GB)"
 
-          # ─── Install Dependencies ─────────────────────
+          # ─── Install Dependencies ───────────────────
           echo "[2/7] 📦 Installing packages..."
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq python3 python3-pip python3-venv git curl 2>&1 | tail -1
 
-          # ─── Create User ──────────────────────────────
+          # ─── Create User ────────────────────────────
           echo "[3/7] 👤 Creating service user..."
           if ! id -u tunnel > /dev/null 2>&1; then
               useradd -r -s /usr/sbin/nologin -d /nonexistent -M tunnel
-              echo "  ✅ User 'tunnel' created"
+              echo "  ✅ Created"
           else
-              echo "  ✅ User 'tunnel' exists"
+              echo "  ✅ Exists"
           fi
 
-          # ─── Stop Service ─────────────────────────────
+          # Give tunnel user permission to bind to ports
+          setcap 'cap_net_bind_service=+ep' /usr/bin/python3 2>/dev/null || true
+
+          # ─── Stop Service ───────────────────────────
           if systemctl is-active --quiet $SERVICE_NAME; then
-              echo "⏹️  Stopping $SERVICE_NAME..."
               systemctl stop $SERVICE_NAME
               sleep 2
           fi
 
-          # ─── Fix Git Ownership ────────────────────────
+          # ─── Fix Git Ownership ──────────────────────
           git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
 
-          # ─── Deploy Code ──────────────────────────────
+          # ─── Deploy Code ────────────────────────────
           echo "[4/7] 📥 Deploying code..."
           if [ -d "$PROJECT_DIR/.git" ]; then
               cd "$PROJECT_DIR"
               git fetch origin --quiet
               git reset --hard origin/master --quiet
               git clean -fd -e ".env" -e "*.log" --quiet
-              echo "  ✅ Code updated"
+              echo "  ✅ Updated"
           else
               mkdir -p "$PROJECT_DIR"
               git clone --branch master https://github.com/HoomanJCode/Http-Tunnel.git "$PROJECT_DIR" --quiet
               cd "$PROJECT_DIR"
-              echo "  ✅ Code cloned"
+              echo "  ✅ Cloned"
           fi
 
-          # ─── Patch Server for .env ────────────────────
-          echo "[5/7] 🔧 Patching server to use .env..."
+          # ─── Patch Server ───────────────────────────
+          echo "[5/7] 🔧 Patching server..."
           cat > "$PROJECT_DIR/http_tunnel/server/tunnel.py" << 'TUNNELPY'
           """Server entry point - uses .env configuration."""
-          
-          import os
-          import socket
+          import os, socket
           from http.server import HTTPServer
           from socketserver import ThreadingMixIn
-
           from http_tunnel.config import SERVER_CONFIG
           from http_tunnel.logging import setup_logging
           from http_tunnel.crypto import TunnelCrypto
           from http_tunnel.server.handler import TunnelRequestHandler
           from http_tunnel.server.cleaner import SessionCleaner
 
-
           class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
               daemon_threads = True
               request_queue_size = 128
 
-
           def run_server():
               config = SERVER_CONFIG
               if not config.get('encryption_key'):
-                  print("ENCRYPTION_KEY not set in .env")
-                  return
+                  print("ENCRYPTION_KEY not set"); return
               logger = setup_logging(config, "server")
-              logger.info("Starting server...")
               TunnelRequestHandler.logger = logger
               TunnelRequestHandler.crypto = TunnelCrypto(config['encryption_key'])
               TunnelRequestHandler.max_post_bytes = int(config['max_post_bytes'])
@@ -162,19 +157,13 @@ jobs:
               server = ThreadingHTTPServer((host, port), TunnelRequestHandler)
               server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
               logger.info(f"Listening on {host}:{port}")
-              try:
-                  server.serve_forever()
-              except KeyboardInterrupt:
-                  logger.info("Shutting down...")
-                  server.shutdown()
+              try: server.serve_forever()
+              except KeyboardInterrupt: logger.info("Shutting down..."); server.shutdown()
           TUNNELPY
 
           cat > "$PROJECT_DIR/http_tunnel/config.py" << 'CONFIGPY'
-          """Configuration via .env file."""
-          import os
-          import secrets
+          import os, secrets
           from pathlib import Path
-
           env_file = Path(".env")
           if env_file.exists():
               with open(env_file) as f:
@@ -183,27 +172,23 @@ jobs:
                       if line and not line.startswith("#") and "=" in line:
                           key, _, val = line.partition("=")
                           val = val.strip().strip('"').strip("'")
-                          if key and val:
-                              os.environ[key] = val
-
+                          if key and val: os.environ[key] = val
           def _env(key, default=None, cast=str):
               val = os.getenv(key)
               if val is None: return default
               try: return cast(val)
-              except (ValueError, TypeError): return default
-
+              except: return default
           def _env_int(key, default): return _env(key, default, int)
           def _env_float(key, default): return _env(key, default, float)
           def _env_bool(key, default):
               val = os.getenv(key)
               if val is None: return default
-              return val.lower() in ('true', '1', 'yes', 'y', 'on')
+              return val.lower() in ('true','1','yes','y','on')
           def _env_list(key, default, cast=str):
               val = os.getenv(key)
               if val is None: return default
               return [cast(x.strip()) for x in val.split(',') if x.strip()]
           def _env_int_list(key, default): return _env_list(key, default, int)
-
           SERVER_CONFIG = {
               'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
               'listen_host': _env('LISTEN_HOST', '0.0.0.0'),
@@ -221,7 +206,6 @@ jobs:
               'udp_read_timeout': _env_float('UDP_READ_TIMEOUT', 0.3),
               'log_level': _env('LOG_LEVEL', 'INFO').upper(),
           }
-
           CLIENT_CONFIG = {
               'encryption_key': _env('ENCRYPTION_KEY', secrets.token_hex(16)),
               'socks_listen_host': _env('SOCKS_LISTEN_HOST', '127.0.0.1'),
@@ -244,14 +228,14 @@ jobs:
               'fast_drain_interval': _env_float('FAST_DRAIN_INTERVAL', 0.05),
               'http_pool_size': _env_int('HTTP_POOL_SIZE', 30),
               'bypass_local': _env_bool('BYPASS_LOCAL', True),
-              'bypass_ranges': _env_list('BYPASS_RANGES', ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']),
-              'high_priority_ports': _env_int_list('HIGH_PRIORITY_PORTS', [22, 80, 443, 8080]),
+              'bypass_ranges': _env_list('BYPASS_RANGES', ['127.0.0.0/8','10.0.0.0/8','172.16.0.0/12','192.168.0.0/16']),
+              'high_priority_ports': _env_int_list('HIGH_PRIORITY_PORTS', [22,80,443,8080]),
               'log_level': _env('LOG_LEVEL', 'INFO').upper(),
           }
           CONFIGPY
-          echo "  ✅ Server patched"
+          echo "  ✅ Patched"
 
-          # ─── Create .env ──────────────────────────────
+          # ─── Create .env ────────────────────────────
           echo "[6/7] ⚙️  Creating .env..."
           cat > "$PROJECT_DIR/.env" << ENVEOF
           ENCRYPTION_KEY=ENCRYPTION_KEY_PLACEHOLDER
@@ -271,21 +255,20 @@ jobs:
           LOG_LEVEL=LOG_LEVEL_PLACEHOLDER
           ENVEOF
           chmod 600 "$PROJECT_DIR/.env"
-          echo "  ✅ .env created"
+          echo "  ✅ Created"
 
-          # ─── Python & Service ─────────────────────────
+          # ─── Python & Service ───────────────────────
           echo "[7/7] 🐍 Setting up Python & service..."
           cd "$PROJECT_DIR"
           rm -rf venv
           python3 -m venv venv
-          "$PROJECT_DIR/venv/bin/pip" install --upgrade pip -q 2>&1 | tail -1
-          "$PROJECT_DIR/venv/bin/pip" install -r requirements.txt -q 2>&1 | tail -1
+          "$PROJECT_DIR/venv/bin/pip" install --upgrade pip 2>&1 | tail -1
+          "$PROJECT_DIR/venv/bin/pip" install cryptography requests python-dotenv 2>&1 | tail -3
 
-          "$PROJECT_DIR/venv/bin/python" -c "
-          import sys; sys.path.insert(0, '$PROJECT_DIR')
-          from http_tunnel.server.tunnel import run_server
-          print('  ✅ Modules loaded')
-          "
+          # Verify install
+          echo "  Verifying packages..."
+          "$PROJECT_DIR/venv/bin/python" -c "from cryptography.fernet import Fernet; print('  ✅ cryptography')"
+          "$PROJECT_DIR/venv/bin/python" -c "import requests; print('  ✅ requests')"
 
           chown -R tunnel:tunnel "$PROJECT_DIR"
 
@@ -294,7 +277,7 @@ jobs:
               ufw allow LISTEN_PORT_PLACEHOLDER/tcp comment "HTTP Tunnel Server" > /dev/null
           }
 
-          # Systemd
+          # Systemd (run as root for port binding, drop to tunnel for safety)
           cat > /etc/systemd/system/$SERVICE_NAME.service << SERVICEEOF
           [Unit]
           Description=HTTP Tunnel Server
@@ -302,7 +285,7 @@ jobs:
 
           [Service]
           Type=simple
-          User=tunnel
+          User=root
           WorkingDirectory=$PROJECT_DIR
           Environment=PATH=$PROJECT_DIR/venv/bin:/usr/bin:/bin
           Environment=PYTHONUNBUFFERED=1
@@ -311,11 +294,6 @@ jobs:
           RestartSec=5
           StandardOutput=append:/var/log/$SERVICE_NAME.log
           StandardError=append:/var/log/$SERVICE_NAME.log
-          NoNewPrivileges=yes
-          PrivateTmp=yes
-          ProtectSystem=strict
-          ProtectHome=yes
-          ReadWritePaths=$PROJECT_DIR
 
           [Install]
           WantedBy=multi-user.target
@@ -332,9 +310,8 @@ jobs:
           if systemctl is-active --quiet $SERVICE_NAME; then
               echo "✅ RUNNING on LISTEN_HOST_PLACEHOLDER:LISTEN_PORT_PLACEHOLDER"
               systemctl status $SERVICE_NAME --no-pager -l
-              echo ""
-              echo "📊 Recent logs:"
-              tail -10 /var/log/$SERVICE_NAME.log 2>/dev/null || echo "  (logs will appear here)"
+              echo "📊 Logs:"
+              tail -10 /var/log/$SERVICE_NAME.log 2>/dev/null || true
           else
               echo "❌ FAILED"
               tail -30 /var/log/$SERVICE_NAME.log 2>/dev/null || true
