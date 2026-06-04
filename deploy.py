@@ -8,7 +8,9 @@ Local usage:
 
 GitHub Actions usage:
     Set secrets in repository: VPS_HOST, VPS_USER, VPS_PORT,
-    VPS_SSH_PRIVATE_KEY, ENCRYPTION_KEY, LISTEN_PORT, LOG_LEVEL
+    VPS_SSH_PRIVATE_KEY, ENCRYPTION_KEY
+
+All server config parameters are written to the VPS .env file.
 """
 
 import os
@@ -22,11 +24,9 @@ from pathlib import Path
 
 def load_env():
     """Load configuration from .env (local) or GitHub Actions secrets."""
-    # GitHub Actions sets GITHUB_ACTIONS=true automatically
     is_github = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
     
     if is_github:
-        # GitHub Actions: secrets are already in environment
         required = ["VPS_HOST", "VPS_USER", "ENCRYPTION_KEY"]
         missing = [k for k in required if not os.getenv(k)]
         if missing:
@@ -36,7 +36,6 @@ def load_env():
         print("✅ Using GitHub Actions secrets")
         return
     
-    # Local: try python-dotenv, fallback to manual parsing
     env_file = Path(".env")
     if not env_file.exists():
         print("⚠️  No .env file found. Using environment variables only.")
@@ -58,16 +57,41 @@ def load_env():
         print("✅ Loaded .env file (manual parse)")
 
 
-# Load config immediately
 load_env()
 
+# ─── VPS Connection ─────────────────────────────────────
 VPS_HOST = os.getenv("VPS_HOST", "")
 VPS_USER = os.getenv("VPS_USER", "root")
 VPS_PORT = os.getenv("VPS_PORT", "22")
+
+# ─── Required ──────────────────────────────────────────
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+
+# ─── Network ───────────────────────────────────────────
+LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = os.getenv("LISTEN_PORT", "8080")
+
+# ─── Timeouts ──────────────────────────────────────────
+TCP_TIMEOUT = os.getenv("TCP_TIMEOUT", "60")
+UDP_TIMEOUT = os.getenv("UDP_TIMEOUT", "120")
+CONNECT_TIMEOUT = os.getenv("CONNECT_TIMEOUT", "8")
+CLEANUP_INTERVAL = os.getenv("CLEANUP_INTERVAL", "30")
+
+# ─── Buffer & Read Settings ────────────────────────────
+RECV_BUFFER = os.getenv("RECV_BUFFER", "131072")
+SEND_BUFFER = os.getenv("SEND_BUFFER", "131072")
+READ_CHUNK = os.getenv("READ_CHUNK", "65536")
+READ_TIMEOUT = os.getenv("READ_TIMEOUT", "0.01")
+READ_EXTEND = os.getenv("READ_EXTEND", "0.03")
+UDP_READ_TIMEOUT = os.getenv("UDP_READ_TIMEOUT", "0.3")
+
+# ─── Limits ────────────────────────────────────────────
+MAX_POST_BYTES = os.getenv("MAX_POST_BYTES", "5242880")
+
+# ─── Logging ───────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+# ─── Paths ─────────────────────────────────────────────
 PROJECT_DIR = "/opt/http-tunnel"
 SERVICE_NAME = "http-tunnel-server"
 REPO_URL = "https://github.com/HoomanJCode/Http-Tunnel.git"
@@ -75,7 +99,7 @@ REPO_URL = "https://github.com/HoomanJCode/Http-Tunnel.git"
 
 # ─── Deploy Script Generation ───────────────────────────
 def generate_deploy_script():
-    """Generate complete bash script for VPS setup."""
+    """Generate complete bash script that sets up everything on VPS."""
     
     script = textwrap.dedent(f'''\
     #!/bin/bash
@@ -84,7 +108,6 @@ def generate_deploy_script():
     PROJECT_DIR="{PROJECT_DIR}"
     SERVICE_NAME="{SERVICE_NAME}"
     REPO_URL="{REPO_URL}"
-    LISTEN_PORT="{LISTEN_PORT}"
 
     echo "=========================================="
     echo "  HTTP Tunnel Server - Auto Deploy"
@@ -114,8 +137,8 @@ def generate_deploy_script():
 
     # ─── Firewall ──────────────────────────────────────
     echo "[3/8] 🔥 Opening port {LISTEN_PORT}..."
-    ufw status | grep -q "$LISTEN_PORT/tcp" || {{
-        ufw allow $LISTEN_PORT/tcp comment "HTTP Tunnel Server" > /dev/null
+    ufw status | grep -q "{LISTEN_PORT}/tcp" || {{
+        ufw allow {LISTEN_PORT}/tcp comment "HTTP Tunnel Server" > /dev/null
         echo "  ✅ Port {LISTEN_PORT} opened"
     }}
     echo "  Firewall: $(ufw status | head -1)"
@@ -146,14 +169,26 @@ def generate_deploy_script():
     # ─── Create .env ───────────────────────────────────
     echo "[6/8] ⚙️  Creating .env..."
     cat > "$PROJECT_DIR/.env" << 'ENVEOF'
+    # HTTP Tunnel Server Configuration
     ENCRYPTION_KEY={ENCRYPTION_KEY}
-    LISTEN_HOST=0.0.0.0
+    LISTEN_HOST={LISTEN_HOST}
     LISTEN_PORT={LISTEN_PORT}
+    TCP_TIMEOUT={TCP_TIMEOUT}
+    UDP_TIMEOUT={UDP_TIMEOUT}
+    CONNECT_TIMEOUT={CONNECT_TIMEOUT}
+    CLEANUP_INTERVAL={CLEANUP_INTERVAL}
+    RECV_BUFFER={RECV_BUFFER}
+    SEND_BUFFER={SEND_BUFFER}
+    READ_CHUNK={READ_CHUNK}
+    READ_TIMEOUT={READ_TIMEOUT}
+    READ_EXTEND={READ_EXTEND}
+    UDP_READ_TIMEOUT={UDP_READ_TIMEOUT}
+    MAX_POST_BYTES={MAX_POST_BYTES}
     LOG_LEVEL={LOG_LEVEL}
     ENVEOF
     chmod 600 "$PROJECT_DIR/.env"
     chown -R tunnel:tunnel "$PROJECT_DIR"
-    echo "  ✅ .env created"
+    echo "  ✅ .env created with all parameters"
 
     # ─── Python Environment ────────────────────────────
     echo "[7/8] 🐍 Setting up Python..."
@@ -207,7 +242,7 @@ def generate_deploy_script():
     sleep 4
 
     if systemctl is-active --quiet $SERVICE_NAME; then
-        echo "✅ RUNNING on 0.0.0.0:{LISTEN_PORT}"
+        echo "✅ RUNNING on {LISTEN_HOST}:{LISTEN_PORT}"
         systemctl status $SERVICE_NAME --no-pager -l
         echo "📊 Logs:"
         tail -10 /var/log/{SERVICE_NAME}.log 2>/dev/null || true
@@ -296,7 +331,12 @@ def cmd_deploy(dry_run=False):
     if not ENCRYPTION_KEY:
         print("❌ ENCRYPTION_KEY not set")
         sys.exit(1)
-    print(f"🚀 Deploying to {VPS_USER}@{VPS_HOST}:{VPS_PORT} (port {LISTEN_PORT})")
+    print(f"🚀 Deploying to {VPS_USER}@{VPS_HOST}:{VPS_PORT}")
+    print(f"   Port: {LISTEN_PORT}")
+    print(f"   Key:  {ENCRYPTION_KEY[:12]}***")
+    print(f"   TCP timeout: {TCP_TIMEOUT}s, UDP: {UDP_TIMEOUT}s")
+    print(f"   Buffers: recv={RECV_BUFFER}, send={SEND_BUFFER}")
+    print()
     script = generate_deploy_script()
     if upload_and_run(script, dry_run) and not dry_run:
         print(f"\n✅ Done! Client config: SERVER_URL=http://{VPS_HOST}:{LISTEN_PORT}/tunnel")
