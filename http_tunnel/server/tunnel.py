@@ -5,7 +5,7 @@ import socket
 from http.server import HTTPServer
 from socketserver import ThreadingMixIn
 
-from http_tunnel.config import generate_server_config, load_and_clean_config
+from http_tunnel.config import SERVER_CONFIG
 from http_tunnel.logging import setup_logging
 from http_tunnel.crypto import TunnelCrypto
 from http_tunnel.server.handler import TunnelRequestHandler
@@ -19,34 +19,41 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def run_server():
-    config_path = "server_config.json"
-    if not os.path.exists(config_path):
-        print(f"Config {config_path} not found. Running wizard...")
-        if not generate_server_config(config_path):
-            print("Cancelled.")
-            return
-    config = load_and_clean_config(config_path, "server")
+    config = SERVER_CONFIG
+    
+    if not config.get('encryption_key'):
+        print("❌ ENCRYPTION_KEY not set in .env file")
+        print("   Create .env with: ENCRYPTION_KEY=your-secret-key")
+        return
+    
     logger = setup_logging(config, "server")
     logger.info("Starting server...")
+    
     TunnelRequestHandler.logger = logger
-    TunnelRequestHandler.crypto = TunnelCrypto(config["encryption_key"])
-    TunnelRequestHandler.max_post_bytes = config["max_post_bytes"]
-    TunnelRequestHandler.tcp_timeout = config["tcp_timeout"]
-    TunnelRequestHandler.udp_timeout = config["udp_timeout"]
-    TunnelRequestHandler.connect_timeout = config["connect_timeout"]
-    TunnelRequestHandler.recv_buffer = config["recv_buffer"]
-    TunnelRequestHandler.send_buffer = config["send_buffer"]
-    TunnelRequestHandler.read_chunk = config["read_chunk"]
-    TunnelRequestHandler.read_timeout = config["read_timeout"]
-    TunnelRequestHandler.read_extend = config["read_extend"]
-    TunnelRequestHandler.udp_read_timeout = config["udp_read_timeout"]
-    cleaner = SessionCleaner(TunnelRequestHandler, config["cleanup_interval"])
+    TunnelRequestHandler.crypto = TunnelCrypto(config['encryption_key'])
+    TunnelRequestHandler.max_post_bytes = int(config['max_post_bytes'])
+    TunnelRequestHandler.tcp_timeout = float(config['tcp_timeout'])
+    TunnelRequestHandler.udp_timeout = float(config['udp_timeout'])
+    TunnelRequestHandler.connect_timeout = float(config['connect_timeout'])
+    TunnelRequestHandler.recv_buffer = int(config['recv_buffer'])
+    TunnelRequestHandler.send_buffer = int(config['send_buffer'])
+    TunnelRequestHandler.read_chunk = int(config['read_chunk'])
+    TunnelRequestHandler.read_timeout = float(config['read_timeout'])
+    TunnelRequestHandler.read_extend = float(config['read_extend'])
+    TunnelRequestHandler.udp_read_timeout = float(config['udp_read_timeout'])
+    
+    cleaner = SessionCleaner(TunnelRequestHandler, float(config['cleanup_interval']))
     cleaner.start()
-    host, port = config["listen"].split(":")
-    server = ThreadingHTTPServer((host, int(port)), TunnelRequestHandler)
+    
+    host = config['listen_host']
+    port = int(config['listen_port'])
+    server = ThreadingHTTPServer((host, port), TunnelRequestHandler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
     logger.info(f"Listening on {host}:{port} (multi-threaded)")
     logger.info(f"TCP timeout: {config['tcp_timeout']}s, UDP: {config['udp_timeout']}s")
+    logger.info(f"Buffers: recv={config['recv_buffer']}, send={config['send_buffer']}")
+    
     try:
         server.serve_forever()
     except KeyboardInterrupt:

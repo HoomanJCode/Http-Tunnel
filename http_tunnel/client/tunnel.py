@@ -1,4 +1,4 @@
-"""HTTP tunnel client - with detailed connection tracking."""
+"""HTTP tunnel client - .env configuration with connection tracking."""
 
 import socket
 import time
@@ -18,7 +18,7 @@ from http_tunnel.protocol import (
     PROTO_TCP, PROTO_UDP, create_connect_message,
     create_session_message, MSG_CLOSE, MSG_HEARTBEAT
 )
-from http_tunnel.config import generate_client_config, load_and_clean_config
+from http_tunnel.config import CLIENT_CONFIG
 from http_tunnel.logging import setup_logging
 from http_tunnel.client.socks import Socks5Server
 from http_tunnel.client.direct import DirectConnector
@@ -55,24 +55,18 @@ class ConnectionTracker:
         self.connections = {}
         self.lock = threading.Lock()
         self.stats = {
-            'created': 0,
-            'closed': 0,
-            'timeouts': 0,
-            'errors': 0,
-            'active': 0,
+            'created': 0, 'closed': 0, 'timeouts': 0,
+            'errors': 0, 'active': 0,
         }
         self.lifetimes = collections.deque(maxlen=200)
         self.last_log = time.time()
-        self.log_interval = 15  # Log at least every 15 seconds
+        self.log_interval = 15
     
     def created(self, sid):
         with self.lock:
             self.connections[sid] = {
-                'created': time.time(),
-                'requests': 0,
-                'last_used': time.time(),
-                'bytes_sent': 0,
-                'bytes_recv': 0,
+                'created': time.time(), 'requests': 0,
+                'last_used': time.time(), 'bytes_sent': 0, 'bytes_recv': 0,
             }
             self.stats['created'] += 1
             self.stats['active'] = len(self.connections)
@@ -98,15 +92,11 @@ class ConnectionTracker:
         with self.lock:
             if sid in self.connections:
                 lifetime = now - self.connections[sid]['created']
-                reqs = self.connections[sid]['requests']
-                sent = self.connections[sid]['bytes_sent']
-                recv = self.connections[sid]['bytes_recv']
                 self.lifetimes.append(lifetime)
                 del self.connections[sid]
                 self.stats['closed'] += 1
                 self.stats['active'] = len(self.connections)
         
-        # Log stats periodically or randomly
         if random.random() < 0.08 or (now - self.last_log > self.log_interval):
             self._log_stats()
             self.last_log = now
@@ -124,28 +114,20 @@ class ConnectionTracker:
                 avg_life = sum(lifetimes) / len(lifetimes)
                 min_life = min(lifetimes)
                 max_life = max(lifetimes)
-                # Median
                 sorted_life = sorted(lifetimes)
-                mid = len(sorted_life) // 2
-                median_life = sorted_life[mid]
+                median_life = sorted_life[len(sorted_life) // 2]
             else:
                 avg_life = min_life = max_life = median_life = 0
             
-            # Count connections by age
             now = time.time()
             age_buckets = {'<1s': 0, '1-5s': 0, '5-15s': 0, '15-30s': 0, '>30s': 0}
             for conn in self.connections.values():
                 age = now - conn['created']
-                if age < 1:
-                    age_buckets['<1s'] += 1
-                elif age < 5:
-                    age_buckets['1-5s'] += 1
-                elif age < 15:
-                    age_buckets['5-15s'] += 1
-                elif age < 30:
-                    age_buckets['15-30s'] += 1
-                else:
-                    age_buckets['>30s'] += 1
+                if age < 1:       age_buckets['<1s'] += 1
+                elif age < 5:     age_buckets['1-5s'] += 1
+                elif age < 15:    age_buckets['5-15s'] += 1
+                elif age < 30:    age_buckets['15-30s'] += 1
+                else:             age_buckets['>30s'] += 1
         
         self.logger.info(
             f"[Stats] active={active} created={created} closed={closed} "
@@ -156,17 +138,15 @@ class ConnectionTracker:
         )
     
     def force_log(self):
-        """Force a stats log now."""
         self._log_stats()
         self.last_log = time.time()
 
 
 class HttpSessionPool:
-    """Pool of HTTP sessions with connection tracking."""
+    """Pool of HTTP sessions for concurrent requests."""
     
-    def __init__(self, proxy_url=None, pool_size=30, tracker=None):
+    def __init__(self, proxy_url=None, pool_size=30):
         self._proxy_url = proxy_url
-        self._tracker = tracker
         self._pool = []
         self._lock = threading.Lock()
         self._index = 0
@@ -192,44 +172,42 @@ class HttpSessionPool:
 
 
 class SocksToHttpTunnel:
-    """Bridges SOCKS5/HTTP proxy to HTTP tunnel with connection tracking."""
+    """Bridges SOCKS5/HTTP proxy to HTTP tunnel with .env configuration."""
     
-    def __init__(self, config_path: str = "client_config.json"):
-        if not self._load_config(config_path):
-            raise RuntimeError("Setup cancelled.")
+    def __init__(self):
+        self.config = CLIENT_CONFIG
         self.logger = setup_logging(self.config, "client")
         self.tracker = ConnectionTracker(self.logger)
-        self.crypto = TunnelCrypto(self.config["encryption_key"])
-        self.server_url = self.config["server_url"]
+        self.crypto = TunnelCrypto(self.config['encryption_key'])
+        self.server_url = self.config['server_url']
         self.running = True
         
         self._using_proxy = False
         self._proxy_url = None
-        if self.config.get("outbound_http_proxy"):
-            self._proxy_url = self.config["outbound_http_proxy"]
+        if self.config.get('outbound_proxy'):
+            self._proxy_url = self.config['outbound_proxy']
             self._using_proxy = True
         
-        self.http_timeout = self.config["http_timeout"]
-        self.heartbeat_interval = self.config["heartbeat_interval"]
-        self.heartbeat_max = self.config.get("heartbeat_max", 15)
-        self.batch_wait = self.config["batch_wait"]
-        self.reconnect_delay = self.config["reconnect_delay"]
-        self.max_bytes = self.config["max_post_bytes"]
-        self.bypass_local = self.config["bypass_local"]
+        self.http_timeout = self.config['http_timeout']
+        self.heartbeat_interval = self.config['heartbeat_interval']
+        self.heartbeat_max = self.config['heartbeat_max']
+        self.batch_wait = self.config['batch_wait']
+        self.reconnect_delay = self.config['reconnect_delay']
+        self.max_bytes = self.config['max_post_bytes']
+        self.bypass_local = self.config['bypass_local']
         self._setup_bypass_networks()
-        self.route_tls = self.config.get("route_tls", "tunnel")
-        self.route_http = self.config.get("route_http", "tunnel")
-        self.route_other = self.config.get("route_other", "tunnel")
-        socks_addr = self.config["socks_listen"].split(":")
-        self.socks_host = socks_addr[0]
-        self.socks_port = int(socks_addr[1])
-        self.dns_mode = self.config["dns_mode"]
-        self.recv_chunk = self.config.get("recv_chunk", 65536)
-        self.fast_drain_threshold = self.config.get("fast_drain_threshold", 32768)
-        self.fast_drain_interval = self.config.get("fast_drain_interval", 0.05)
-        self.http_pool_size = self.config.get("http_pool_size", 30)
+        self.route_tls = self.config['route_tls']
+        self.route_http = self.config['route_http']
+        self.route_other = self.config['route_other']
+        self.socks_host = self.config['socks_listen_host']
+        self.socks_port = self.config['socks_listen_port']
+        self.dns_mode = self.config['dns_mode']
+        self.recv_chunk = self.config['recv_chunk']
+        self.fast_drain_threshold = self.config['fast_drain_threshold']
+        self.fast_drain_interval = self.config['fast_drain_interval']
+        self.http_pool_size = self.config['http_pool_size']
         
-        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size, tracker=self.tracker)
+        self._http_pool = HttpSessionPool(proxy_url=self._proxy_url, pool_size=self.http_pool_size)
         self._thread_sessions = {}
         self._thread_lock = threading.Lock()
         
@@ -245,17 +223,9 @@ class SocksToHttpTunnel:
         
         self.logger.info("Client ready")
     
-    def _load_config(self, config_path: str) -> bool:
-        if not os.path.exists(config_path):
-            print(f"Config {config_path} not found. Running wizard...")
-            if not generate_client_config(config_path):
-                return False
-        self.config = load_and_clean_config(config_path, "client")
-        return True
-    
     def _setup_bypass_networks(self):
         self.bypass_networks = []
-        for cidr in self.config.get("bypass_ranges", ["127.0.0.0/8"]):
+        for cidr in self.config.get('bypass_ranges', ["127.0.0.0/8"]):
             try:
                 self.bypass_networks.append(ipaddress.ip_network(cidr, strict=False))
             except ValueError:
@@ -411,7 +381,7 @@ class SocksToHttpTunnel:
     def _handle_via_proxy(self, local_conn, target_host, target_port, thread_id, first_byte=b''):
         remote = None
         try:
-            proxy_url = self.config["outbound_http_proxy"]
+            proxy_url = self.config['outbound_proxy']
             proxy_host = proxy_url.split("://")[1].split(":")[0] if "://" in proxy_url else proxy_url.split(":")[0]
             proxy_port = int(proxy_url.split(":")[-1]) if ":" in proxy_url.split("://")[-1] else 8080
             remote = socket.create_connection((proxy_host, proxy_port), timeout=10)
@@ -572,7 +542,7 @@ class SocksToHttpTunnel:
     def start(self):
         self.logger.info(f"Proxy {self.socks_host}:{self.socks_port} -> {self.server_url}")
         if self._using_proxy:
-            self.logger.info(f"Outbound: {self.config['outbound_http_proxy']}")
+            self.logger.info(f"Outbound: {self.config['outbound_proxy']}")
         self.logger.info(f"TLS:{self.route_tls} HTTP:{self.route_http} Other:{self.route_other}")
         self.logger.info(f"Pool:{self.http_pool_size} HB:{self.heartbeat_interval}s Drain:>{self.fast_drain_threshold}B")
         self.logger.info(f"curl --proxy http://127.0.0.1:{self.socks_port} https://example.com")
